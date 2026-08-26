@@ -21,6 +21,12 @@ pub enum DrawCommand {
         join: LineJoin,
         miter_limit: f64,
     },
+    Image {
+        width: u32,
+        height: u32,
+        rgba_data: Vec<u8>,
+        transform: crate::matrix::Matrix2D,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -70,6 +76,17 @@ impl RenderTarget {
         }
     }
 
+    pub fn push_image(&mut self, width: u32, height: u32, rgba_data: Vec<u8>, transform: crate::matrix::Matrix2D) {
+        if width > 0 && height > 0 && !rgba_data.is_empty() {
+            self.commands.push(DrawCommand::Image {
+                width,
+                height,
+                rgba_data,
+                transform,
+            });
+        }
+    }
+
     pub fn render_to_pixmap(&self, background: Color) -> PsResult<Pixmap> {
         let mut pixmap = Pixmap::new(self.width, self.height)
             .ok_or_else(|| PsError::LimitCheck("could not allocate pixmap".to_string()))?;
@@ -83,6 +100,27 @@ impl RenderTarget {
 
         for cmd in &self.commands {
             match cmd {
+                DrawCommand::Image { width, height, rgba_data, transform } => {
+                    if let Some(size) = tiny_skia::IntSize::from_wh(*width, *height) {
+                        if let Some(img_pixmap) = tiny_skia::PixmapRef::from_bytes(rgba_data, size.width(), size.height()) {
+                            let sk_transform = Transform::from_row(
+                                transform.a as f32,
+                                transform.b as f32,
+                                transform.c as f32,
+                                transform.d as f32,
+                                transform.tx as f32,
+                                transform.ty as f32,
+                            );
+                            pixmap.draw_pixmap(
+                                0, 0,
+                                img_pixmap,
+                                &tiny_skia::PixmapPaint::default(),
+                                sk_transform,
+                                None,
+                            );
+                        }
+                    }
+                }
                 DrawCommand::Fill { path, color, even_odd } => {
                     if let Some(sk_path) = self.build_skia_path(path) {
                         let mut paint = Paint::default();

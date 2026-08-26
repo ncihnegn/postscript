@@ -7,7 +7,8 @@ description = "A native PostScript interpreter, DSC parser, and 2D vector render
 
 [dependencies]
 tiny-skia = "0.11"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+miniz_oxide = "0.8"
 thiserror = "2.0"
 
 [lib]

@@ -647,28 +647,143 @@ impl Interpreter {
                 self.operand_stack.push(Value::String(hex_bytes));
                 self.operand_stack.push(Value::Bool(not_eof));
             }
-            "image" => {
-                let proc = self.pop_value()?;
-                let _mat_val = self.pop_value()?;
-                let _bits = self.pop_num()?;
-                let h = self.pop_num().unwrap_or(1.0) as usize;
-                let w = self.pop_num().unwrap_or(1.0) as usize;
-                let total_needed = w * h;
-                let mut bytes_read = 0;
-                while bytes_read < total_needed {
-                    self.execute_proc_value(proc.clone(), lexer)?;
-                    if let Ok(val) = self.pop_value() {
-                        match val {
-                            Value::String(s) => {
-                                if s.is_empty() {
-                                    break;
-                                }
-                                bytes_read += s.len();
+            "filter" => {
+                let filter_name = self.pop_key_name()?;
+                let source = self.pop_value()?;
+                let dict = Rc::new(RefCell::new(HashMap::new()));
+                dict.borrow_mut().insert("Type".to_string(), Value::LiteralName("Filter".to_string()));
+                dict.borrow_mut().insert("Filter".to_string(), Value::LiteralName(filter_name));
+                dict.borrow_mut().insert("Source".to_string(), source);
+                self.operand_stack.push(Value::Dict(dict));
+            }
+            "setcolorspace" => {
+                self.pop_value().ok();
+            }
+            "setcolor" => {
+                if let Ok(n1) = self.pop_num() {
+                    if let Ok(n2) = self.pop_num() {
+                        if let Ok(n3) = self.pop_num() {
+                            if let Ok(n4) = self.pop_num() {
+                                self.current_gstate.color = Color::cmyk(n4, n3, n2, n1);
+                            } else {
+                                self.current_gstate.color = Color::rgb(n3, n2, n1);
                             }
-                            _ => break,
+                        } else {
+                            self.current_gstate.color = Color::gray(n1);
                         }
                     } else {
-                        break;
+                        self.current_gstate.color = Color::gray(n1);
+                    }
+                }
+            }
+            "image" => {
+                let top = self.pop_value()?;
+                match top {
+                    Value::Dict(d) => {
+                        let w = d.borrow().get("Width").and_then(|v| v.as_i64().ok()).unwrap_or(1) as usize;
+                        let h = d.borrow().get("Height").and_then(|v| v.as_i64().ok()).unwrap_or(1) as usize;
+
+                        // Read hex stream from lexer
+                        let remaining = lexer.remaining_bytes();
+                        let mut hex_end = 0;
+                        while hex_end < remaining.len() && remaining[hex_end] != b'>' && remaining[hex_end] != b'~' {
+                            if remaining[hex_end] == b'%' || remaining[hex_end] == b'\n' || remaining[hex_end] == b'\r' || remaining[hex_end].is_ascii_hexdigit() || remaining[hex_end].is_ascii_whitespace() {
+                                hex_end += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        let hex_slice = &remaining[..hex_end];
+                        lexer.set_position(lexer.position() + hex_end + if hex_end < remaining.len() && remaining[hex_end] == b'>' { 1 } else { 0 });
+
+                        // Convert hex to raw bytes
+                        let mut raw_bytes = Vec::new();
+                        let mut hi_nibble: Option<u8> = None;
+                        for &b in hex_slice {
+                            let nibble = match b {
+                                b'0'..=b'9' => b - b'0',
+                                b'a'..=b'f' => b - b'a' + 10,
+                                b'A'..=b'F' => b - b'A' + 10,
+                                _ => continue,
+                            };
+                            if let Some(hi) = hi_nibble.take() {
+                                raw_bytes.push((hi << 4) | nibble);
+                            } else {
+                                hi_nibble = Some(nibble);
+                            }
+                        }
+
+                        let mut rgba = Vec::with_capacity(w * h * 4);
+                        if let Ok(dyn_img) = image::load_from_memory(&raw_bytes) {
+                            let rgba_img = dyn_img.to_rgba8();
+                            rgba = rgba_img.into_raw();
+                        } else {
+                            let decompressed = if raw_bytes.starts_with(&[0x78]) || raw_bytes.len() >= 2 {
+                                miniz_oxide::inflate::decompress_to_vec_zlib(&raw_bytes).unwrap_or(raw_bytes)
+                            } else {
+                                raw_bytes
+                            };
+
+                            if decompressed.len() >= w * h * 3 {
+                                for chunk in decompressed.chunks_exact(3).take(w * h) {
+                                    rgba.push(chunk[0]);
+                                    rgba.push(chunk[1]);
+                                    rgba.push(chunk[2]);
+                                    rgba.push(255);
+                                }
+                            } else if decompressed.len() >= w * h {
+                                for &g in decompressed.iter().take(w * h) {
+                                    rgba.push(g);
+                                    rgba.push(g);
+                                    rgba.push(g);
+                                    rgba.push(255);
+                                }
+                            }
+                        }
+
+                        if !rgba.is_empty() {
+                            let img_matrix = if let Some(Value::Array(arr)) = d.borrow().get("ImageMatrix") {
+                                if arr.borrow().len() >= 6 {
+                                    let a = arr.borrow()[0].as_f64().unwrap_or(w as f64);
+                                    let b = arr.borrow()[1].as_f64().unwrap_or(0.0);
+                                    let c = arr.borrow()[2].as_f64().unwrap_or(0.0);
+                                    let d_val = arr.borrow()[3].as_f64().unwrap_or(h as f64);
+                                    let tx = arr.borrow()[4].as_f64().unwrap_or(0.0);
+                                    let ty = arr.borrow()[5].as_f64().unwrap_or(0.0);
+                                    Matrix2D::new(a, b, c, d_val, tx, ty).inverse().unwrap_or_else(|| Matrix2D::scale(1.0 / (w as f64), 1.0 / (h as f64)))
+                                } else {
+                                    Matrix2D::scale(1.0 / (w as f64), 1.0 / (h as f64))
+                                }
+                            } else {
+                                Matrix2D::scale(1.0 / (w as f64), 1.0 / (h as f64))
+                            };
+                            let transform = img_matrix.concat(&self.current_gstate.ctm);
+                            self.render_target.push_image(w as u32, h as u32, rgba, transform);
+                        }
+                    }
+                    proc => {
+                        let _mat_val = self.pop_value()?;
+                        let _bits = self.pop_num()?;
+                        let h = self.pop_num().unwrap_or(1.0) as usize;
+                        let w = self.pop_num().unwrap_or(1.0) as usize;
+                        let total_needed = w * h;
+                        let mut bytes_read = 0;
+                        while bytes_read < total_needed {
+                            self.execute_proc_value(proc.clone(), lexer)?;
+                            if let Ok(val) = self.pop_value() {
+                                match val {
+                                    Value::String(s) => {
+                                        if s.is_empty() {
+                                            break;
+                                        }
+                                        bytes_read += s.len();
+                                    }
+                                    _ => break,
+                                }
+                            } else {
+                                break;
+                            }
+                        }
                     }
                 }
             }
