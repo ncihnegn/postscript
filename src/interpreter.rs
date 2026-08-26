@@ -59,9 +59,27 @@ impl Interpreter {
             font_instances: Vec::with_capacity(32),
         };
 
-        // Initialize systemdict and userdict
+        // Initialize systemdict, userdict, statusdict, globaldict
         let systemdict = Rc::new(RefCell::new(HashMap::new()));
         let userdict = Rc::new(RefCell::new(HashMap::new()));
+        let statusdict = Rc::new(RefCell::new(HashMap::new()));
+        let globaldict = Rc::new(RefCell::new(HashMap::new()));
+        let fontdir = Rc::new(RefCell::new(HashMap::new()));
+
+        statusdict.borrow_mut().insert("product".to_string(), Value::String(b"macDVI PostScript".to_vec()));
+        statusdict.borrow_mut().insert("version".to_string(), Value::String(b"3010".to_vec()));
+        statusdict.borrow_mut().insert("revision".to_string(), Value::Integer(1));
+        statusdict.borrow_mut().insert("pagecount".to_string(), Value::Integer(0));
+        statusdict.borrow_mut().insert("waittimeout".to_string(), Value::Integer(300));
+        statusdict.borrow_mut().insert("manualfeed".to_string(), Value::Bool(false));
+        statusdict.borrow_mut().insert("jobname".to_string(), Value::String(b"".to_vec()));
+
+        systemdict.borrow_mut().insert("systemdict".to_string(), Value::Dict(systemdict.clone()));
+        systemdict.borrow_mut().insert("userdict".to_string(), Value::Dict(userdict.clone()));
+        systemdict.borrow_mut().insert("statusdict".to_string(), Value::Dict(statusdict.clone()));
+        systemdict.borrow_mut().insert("globaldict".to_string(), Value::Dict(globaldict.clone()));
+        systemdict.borrow_mut().insert("FontDirectory".to_string(), Value::Dict(fontdir.clone()));
+
         interp.dict_stack.push(systemdict);
         interp.dict_stack.push(userdict);
 
@@ -390,7 +408,9 @@ impl Interpreter {
                         let k = match key_or_index {
                             Value::LiteralName(n) | Value::Name(n) => n,
                             Value::String(s) => String::from_utf8_lossy(&s).to_string(),
-                            _ => return Err(PsError::TypeCheck { expected: "name key", got: key_or_index.type_name().to_string() }),
+                            Value::Integer(i) => i.to_string(),
+                            Value::Real(r) => r.to_string(),
+                            _ => return Err(PsError::TypeCheck { expected: "key", got: key_or_index.type_name().to_string() }),
                         };
                         let val = d.borrow().get(&k).cloned().unwrap_or(Value::Null);
                         self.operand_stack.push(val);
@@ -418,7 +438,9 @@ impl Interpreter {
                         let k = match key_or_index {
                             Value::LiteralName(n) | Value::Name(n) => n,
                             Value::String(s) => String::from_utf8_lossy(&s).to_string(),
-                            _ => return Err(PsError::TypeCheck { expected: "name key", got: key_or_index.type_name().to_string() }),
+                            Value::Integer(i) => i.to_string(),
+                            Value::Real(r) => r.to_string(),
+                            _ => return Err(PsError::TypeCheck { expected: "key", got: key_or_index.type_name().to_string() }),
                         };
                         d.borrow_mut().insert(k, val);
                     }
@@ -451,6 +473,38 @@ impl Interpreter {
                     self.def_in_current_dict(key, val)?;
                 }
             }
+            "where" => {
+                let key = self.pop_key_name()?;
+                let mut found_dict = None;
+                for dict in self.dict_stack.iter().rev() {
+                    if dict.borrow().contains_key(&key) {
+                        found_dict = Some(dict.clone());
+                        break;
+                    }
+                }
+                if let Some(d) = found_dict {
+                    self.operand_stack.push(Value::Dict(d));
+                    self.operand_stack.push(Value::Bool(true));
+                } else {
+                    self.operand_stack.push(Value::Bool(false));
+                }
+            }
+            "load" => {
+                let key = self.pop_key_name()?;
+                if let Some(val) = self.lookup_dict(&key) {
+                    self.operand_stack.push(val);
+                } else {
+                    return Err(PsError::Undefined(format!("/{}", key)));
+                }
+            }
+            "countdictstack" => {
+                self.operand_stack.push(Value::Integer(self.dict_stack.len() as i64));
+            }
+            "maxlength" => {
+                let dict = self.pop_dict()?;
+                let len = dict.borrow().len().max(100);
+                self.operand_stack.push(Value::Integer(len as i64));
+            }
             "currentdict" => {
                 if let Some(d) = self.dict_stack.last() {
                     self.operand_stack.push(Value::Dict(d.clone()));
@@ -464,6 +518,24 @@ impl Interpreter {
             "userdict" => {
                 if self.dict_stack.len() > 1 {
                     self.operand_stack.push(Value::Dict(self.dict_stack[1].clone()));
+                }
+            }
+            "statusdict" => {
+                if let Some(sys) = self.dict_stack.first() {
+                    if let Some(s) = sys.borrow().get("statusdict") {
+                        self.operand_stack.push(s.clone());
+                    } else {
+                        self.operand_stack.push(Value::new_dict());
+                    }
+                }
+            }
+            "globaldict" => {
+                if let Some(sys) = self.dict_stack.first() {
+                    if let Some(g) = sys.borrow().get("globaldict") {
+                        self.operand_stack.push(g.clone());
+                    } else {
+                        self.operand_stack.push(Value::new_dict());
+                    }
                 }
             }
             "FontDirectory" => {
@@ -639,6 +711,51 @@ impl Interpreter {
                 };
                 self.operand_stack.push(Value::String(s.into_bytes()));
             }
+            "cvrs" => {
+                let mut str_buf = self.pop_value()?;
+                let radix = self.pop_i64()? as u32;
+                let num = self.pop_num()?;
+                let int_val = num.round() as i64;
+                let s = if radix >= 2 && radix <= 36 {
+                    format_radix(int_val, radix)
+                } else {
+                    int_val.to_string()
+                };
+                let bytes = s.into_bytes();
+                let result = if let Value::String(ref mut dest) = str_buf {
+                    let len = bytes.len().min(dest.len());
+                    dest[..len].copy_from_slice(&bytes[..len]);
+                    dest[..len].to_vec()
+                } else {
+                    bytes
+                };
+                self.operand_stack.push(Value::String(result));
+            }
+            "cvx" => {
+                let val = self.pop_value()?;
+                let exe = match val {
+                    Value::LiteralName(n) => Value::Name(n),
+                    Value::Array(a) => Value::ExecutableArray(Rc::new(a.borrow().clone())),
+                    other => other,
+                };
+                self.operand_stack.push(exe);
+            }
+            "cvlit" => {
+                let val = self.pop_value()?;
+                let lit = match val {
+                    Value::Name(n) => Value::LiteralName(n),
+                    Value::ExecutableArray(a) => Value::new_array((*a).clone()),
+                    other => other,
+                };
+                self.operand_stack.push(lit);
+            }
+            "readonly" | "executeonly" | "noaccess" => {
+                // Return operand itself
+            }
+            "rcheck" | "wcheck" | "xcheck" => {
+                let _val = self.pop_value()?;
+                self.operand_stack.push(Value::Bool(true));
+            }
 
             // Control flow
             "if" => {
@@ -670,13 +787,21 @@ impl Interpreter {
                 if step > 0.0 {
                     while current <= limit {
                         self.operand_stack.push(Value::Real(current));
-                        self.execute_proc_value(proc.clone(), lexer)?;
+                        match self.execute_proc_value(proc.clone(), lexer) {
+                            Ok(()) => {}
+                            Err(PsError::Exit) => break,
+                            Err(e) => return Err(e),
+                        }
                         current += step;
                     }
                 } else if step < 0.0 {
                     while current >= limit {
                         self.operand_stack.push(Value::Real(current));
-                        self.execute_proc_value(proc.clone(), lexer)?;
+                        match self.execute_proc_value(proc.clone(), lexer) {
+                            Ok(()) => {}
+                            Err(PsError::Exit) => break,
+                            Err(e) => return Err(e),
+                        }
                         current += step;
                     }
                 }
@@ -685,7 +810,11 @@ impl Interpreter {
                 let proc = self.pop_value()?;
                 let count = self.pop_i64()?;
                 for _ in 0..count.max(0) {
-                    self.execute_proc_value(proc.clone(), lexer)?;
+                    match self.execute_proc_value(proc.clone(), lexer) {
+                        Ok(()) => {}
+                        Err(PsError::Exit) => break,
+                        Err(e) => return Err(e),
+                    }
                 }
             }
             "loop" => {
@@ -696,6 +825,58 @@ impl Interpreter {
                         Err(PsError::Exit) => break,
                         Err(e) => return Err(e),
                     }
+                }
+            }
+            "forall" => {
+                let proc = self.pop_value()?;
+                let collection = self.pop_value()?;
+                match collection {
+                    Value::Array(arr) => {
+                        let items = arr.borrow().clone();
+                        for item in items {
+                            self.operand_stack.push(item);
+                            match self.execute_proc_value(proc.clone(), lexer) {
+                                Ok(()) => {}
+                                Err(PsError::Exit) => break,
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
+                    Value::ExecutableArray(arr) => {
+                        let items = (*arr).clone();
+                        for item in items {
+                            self.operand_stack.push(item);
+                            match self.execute_proc_value(proc.clone(), lexer) {
+                                Ok(()) => {}
+                                Err(PsError::Exit) => break,
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
+                    Value::Dict(d) => {
+                        let pairs: Vec<(String, Value)> = d.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                        for (k, v) in pairs {
+                            self.operand_stack.push(Value::LiteralName(k));
+                            self.operand_stack.push(v);
+                            match self.execute_proc_value(proc.clone(), lexer) {
+                                Ok(()) => {}
+                                Err(PsError::Exit) => break,
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
+                    Value::String(s) => {
+                        let bytes = s.clone();
+                        for b in bytes {
+                            self.operand_stack.push(Value::Integer(b as i64));
+                            match self.execute_proc_value(proc.clone(), lexer) {
+                                Ok(()) => {}
+                                Err(PsError::Exit) => break,
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
+                    _ => return Err(PsError::TypeCheck { expected: "array, dict or string", got: collection.type_name().to_string() }),
                 }
             }
             "exit" => return Err(PsError::Exit),
@@ -734,9 +915,6 @@ impl Interpreter {
                     self.gstate_stack = snapshot.gstate_stack;
                 }
             }
-            "readonly" | "executeonly" | "noaccess" => {
-                // Return same object unchanged
-            }
 
             // Graphics State
             "gsave" => {
@@ -755,31 +933,31 @@ impl Interpreter {
                 let y = self.pop_num()?;
                 let x = self.pop_num()?;
                 self.current_gstate.current_path.move_to(x, y);
-                self.current_gstate.current_point = Some((x, y));
+                self.set_current_point_user(x, y);
             }
             "rmoveto" => {
                 let dy = self.pop_num()?;
                 let dx = self.pop_num()?;
-                let (cx, cy) = self.current_gstate.current_point.unwrap_or((0.0, 0.0));
+                let (cx, cy) = self.get_current_point_user().unwrap_or((0.0, 0.0));
                 let nx = cx + dx;
                 let ny = cy + dy;
                 self.current_gstate.current_path.move_to(nx, ny);
-                self.current_gstate.current_point = Some((nx, ny));
+                self.set_current_point_user(nx, ny);
             }
             "lineto" => {
                 let y = self.pop_num()?;
                 let x = self.pop_num()?;
                 self.current_gstate.current_path.line_to(x, y);
-                self.current_gstate.current_point = Some((x, y));
+                self.set_current_point_user(x, y);
             }
             "rlineto" => {
                 let dy = self.pop_num()?;
                 let dx = self.pop_num()?;
-                let (cx, cy) = self.current_gstate.current_point.unwrap_or((0.0, 0.0));
+                let (cx, cy) = self.get_current_point_user().unwrap_or((0.0, 0.0));
                 let nx = cx + dx;
                 let ny = cy + dy;
                 self.current_gstate.current_path.line_to(nx, ny);
-                self.current_gstate.current_point = Some((nx, ny));
+                self.set_current_point_user(nx, ny);
             }
             "curveto" => {
                 let y3 = self.pop_num()?;
@@ -789,7 +967,7 @@ impl Interpreter {
                 let y1 = self.pop_num()?;
                 let x1 = self.pop_num()?;
                 self.current_gstate.current_path.curve_to(x1, y1, x2, y2, x3, y3);
-                self.current_gstate.current_point = Some((x3, y3));
+                self.set_current_point_user(x3, y3);
             }
             "rcurveto" => {
                 let dy3 = self.pop_num()?;
@@ -798,7 +976,7 @@ impl Interpreter {
                 let dx2 = self.pop_num()?;
                 let dy1 = self.pop_num()?;
                 let dx1 = self.pop_num()?;
-                let (cx, cy) = self.current_gstate.current_point.unwrap_or((0.0, 0.0));
+                let (cx, cy) = self.get_current_point_user().unwrap_or((0.0, 0.0));
                 let nx1 = cx + dx1;
                 let ny1 = cy + dy1;
                 let nx2 = nx1 + dx2;
@@ -806,7 +984,7 @@ impl Interpreter {
                 let nx3 = nx2 + dx3;
                 let ny3 = ny2 + dy3;
                 self.current_gstate.current_path.curve_to(nx1, ny1, nx2, ny2, nx3, ny3);
-                self.current_gstate.current_point = Some((nx3, ny3));
+                self.set_current_point_user(nx3, ny3);
             }
             "arc" => {
                 let angle2 = self.pop_num()?;
@@ -817,7 +995,7 @@ impl Interpreter {
                 self.current_gstate.current_path.arc(x, y, r, angle1, angle2, false);
                 let end_x = x + r * angle2.to_radians().cos();
                 let end_y = y + r * angle2.to_radians().sin();
-                self.current_gstate.current_point = Some((end_x, end_y));
+                self.set_current_point_user(end_x, end_y);
             }
             "arcn" => {
                 let angle2 = self.pop_num()?;
@@ -828,13 +1006,13 @@ impl Interpreter {
                 self.current_gstate.current_path.arc(x, y, r, angle1, angle2, true);
                 let end_x = x + r * angle2.to_radians().cos();
                 let end_y = y + r * angle2.to_radians().sin();
-                self.current_gstate.current_point = Some((end_x, end_y));
+                self.set_current_point_user(end_x, end_y);
             }
             "closepath" => {
                 self.current_gstate.current_path.close_path();
             }
             "currentpoint" => {
-                if let Some((x, y)) = self.current_gstate.current_point {
+                if let Some((x, y)) = self.get_current_point_user() {
                     self.operand_stack.push(Value::Real(x));
                     self.operand_stack.push(Value::Real(y));
                 } else {
@@ -1040,10 +1218,20 @@ impl Interpreter {
                     .or_else(|| self.font_directory.get(&name.to_lowercase()))
                     .cloned()
                     .unwrap_or_else(|| FontFace::new(&name));
-                self.font_instances.push(base_font);
+                self.font_instances.push(base_font.clone());
                 let font_id = self.font_instances.len() - 1;
                 let dict = Rc::new(RefCell::new(HashMap::new()));
-                dict.borrow_mut().insert("FontName".to_string(), Value::LiteralName(name));
+                dict.borrow_mut().insert("FontName".to_string(), Value::LiteralName(name.clone()));
+                dict.borrow_mut().insert("FontType".to_string(), Value::Integer(1));
+                dict.borrow_mut().insert("PaintType".to_string(), Value::Integer(0));
+                dict.borrow_mut().insert("FontMatrix".to_string(), Value::new_array(vec![
+                    Value::Real(0.001), Value::Real(0.0), Value::Real(0.0), Value::Real(0.001), Value::Real(0.0), Value::Real(0.0)
+                ]));
+                dict.borrow_mut().insert("FontBBox".to_string(), Value::new_array(vec![
+                    Value::Real(0.0), Value::Real(-250.0), Value::Real(1000.0), Value::Real(750.0)
+                ]));
+                let enc: Vec<Value> = base_font.encoding.iter().map(|s| Value::LiteralName(s.clone())).collect();
+                dict.borrow_mut().insert("Encoding".to_string(), Value::new_array(enc));
                 dict.borrow_mut().insert("_FontId".to_string(), Value::Integer(font_id as i64));
                 self.operand_stack.push(Value::Dict(dict));
             }
@@ -1113,6 +1301,87 @@ impl Interpreter {
                 }.unwrap_or_else(|| FontFace::new("default"));
                 self.current_gstate.font = Some(font);
             }
+            "definefont" => {
+                let font_val = self.pop_value()?;
+                let key = self.pop_key_name()?;
+                let font_dict = match font_val {
+                    Value::Dict(d) => d,
+                    _ => Rc::new(RefCell::new(HashMap::new())),
+                };
+                font_dict.borrow_mut().insert("FontName".to_string(), Value::LiteralName(key.clone()));
+                if !font_dict.borrow().contains_key("FontType") {
+                    font_dict.borrow_mut().insert("FontType".to_string(), Value::Integer(1));
+                }
+
+                let base_font = if let Some(base_id) = font_dict.borrow().get("_FontId").and_then(|v| v.as_i64().ok()) {
+                    self.font_instances.get(base_id as usize).cloned()
+                } else {
+                    None
+                };
+
+                let mut face = base_font.unwrap_or_else(|| {
+                    self.font_directory.get(&key)
+                        .or_else(|| self.font_directory.get(&key.to_uppercase()))
+                        .or_else(|| self.font_directory.get(&key.to_lowercase()))
+                        .cloned()
+                        .unwrap_or_else(|| FontFace::new(&key))
+                });
+                face.name = key.clone();
+
+                if let Some(enc_val) = font_dict.borrow().get("Encoding") {
+                    if let Value::Array(arr) = enc_val {
+                        let strings: Vec<String> = arr.borrow().iter().map(|v| v.as_str_lossy()).collect();
+                        for (i, s) in strings.into_iter().enumerate() {
+                            if i < face.encoding.len() {
+                                face.encoding[i] = s;
+                            }
+                        }
+                    }
+                }
+
+                self.font_directory.insert(key.clone(), face.clone());
+                self.font_instances.push(face);
+                let new_id = self.font_instances.len() - 1;
+                font_dict.borrow_mut().insert("_FontId".to_string(), Value::Integer(new_id as i64));
+                self.operand_stack.push(Value::Dict(font_dict));
+            }
+            "setcachedevice" => {
+                let _ury = self.pop_num().ok();
+                let _urx = self.pop_num().ok();
+                let _lly = self.pop_num().ok();
+                let _llx = self.pop_num().ok();
+                let _wy = self.pop_num().ok();
+                let _wx = self.pop_num().ok();
+            }
+            "setcharwidth" => {
+                let _wy = self.pop_num().ok();
+                let _wx = self.pop_num().ok();
+            }
+            "imagemask" => {
+                let proc = self.pop_value()?;
+                let _mat = self.pop_value()?;
+                let _polarity = self.pop_value()?;
+                let h = self.pop_num().unwrap_or(1.0) as usize;
+                let w = self.pop_num().unwrap_or(1.0) as usize;
+                let total_needed = (w * h + 7) / 8;
+                let mut bytes_read = 0;
+                while bytes_read < total_needed {
+                    self.execute_proc_value(proc.clone(), lexer)?;
+                    if let Ok(val) = self.pop_value() {
+                        match val {
+                            Value::String(s) => {
+                                if s.is_empty() {
+                                    break;
+                                }
+                                bytes_read += s.len();
+                            }
+                            _ => break,
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
             "charpath" => {
                 let _stroke_bool = self.pop_bool()?;
                 let str_val = self.pop_value()?;
@@ -1122,7 +1391,7 @@ impl Interpreter {
                     _ => return Err(PsError::TypeCheck { expected: "string", got: str_val.type_name().to_string() }),
                 };
 
-                let (mut cx, cy) = self.current_gstate.current_point.unwrap_or((0.0, 0.0));
+                let (mut cx, cy) = self.get_current_point_user().unwrap_or((0.0, 0.0));
                 for &b in &bytes {
                     let glyph_name = if let Some(f) = &self.current_gstate.font {
                         f.encoding.get(b as usize).cloned().unwrap_or_else(|| ".notdef".to_string())
@@ -1142,7 +1411,7 @@ impl Interpreter {
                     // Fallback advance for standard characters
                     cx += 6.0;
                 }
-                self.current_gstate.current_point = Some((cx, cy));
+                self.set_current_point_user(cx, cy);
             }
             "show" => {
                 let str_val = self.pop_value()?;
@@ -1152,7 +1421,7 @@ impl Interpreter {
                     _ => return Err(PsError::TypeCheck { expected: "string", got: str_val.type_name().to_string() }),
                 };
 
-                let (mut cx, cy) = self.current_gstate.current_point.unwrap_or((0.0, 0.0));
+                let (mut cx, cy) = self.get_current_point_user().unwrap_or((0.0, 0.0));
                 for &b in &bytes {
                     let glyph_name = if let Some(f) = &self.current_gstate.font {
                         f.encoding.get(b as usize).cloned().unwrap_or_else(|| ".notdef".to_string())
@@ -1171,7 +1440,7 @@ impl Interpreter {
                     }
                     cx += 6.0;
                 }
-                self.current_gstate.current_point = Some((cx, cy));
+                self.set_current_point_user(cx, cy);
             }
 
             "currentfile" => {
@@ -1302,7 +1571,9 @@ impl Interpreter {
         match val {
             Value::LiteralName(n) | Value::Name(n) => Ok(n),
             Value::String(s) => Ok(String::from_utf8_lossy(&s).to_string()),
-            _ => Err(PsError::TypeCheck { expected: "name", got: val.type_name().to_string() }),
+            Value::Integer(i) => Ok(i.to_string()),
+            Value::Real(r) => Ok(r.to_string()),
+            _ => Err(PsError::TypeCheck { expected: "name or key", got: val.type_name().to_string() }),
         }
     }
 
@@ -1327,13 +1598,55 @@ impl Interpreter {
     }
 
     fn op_copy(&mut self) -> PsResult<()> {
-        let count = self.pop_i64()? as usize;
-        let len = self.operand_stack.len();
-        if len < count {
-            return Err(PsError::StackUnderflow);
+        let top = self.pop_value()?;
+        match top {
+            Value::Integer(count) => {
+                let n = count.max(0) as usize;
+                let len = self.operand_stack.len();
+                if len < n {
+                    return Err(PsError::StackUnderflow);
+                }
+                let items = self.operand_stack[len - n..].to_vec();
+                self.operand_stack.extend(items);
+            }
+            Value::Array(dest_arr) => {
+                let src_val = self.pop_value()?;
+                let src_items = match src_val {
+                    Value::Array(src_a) => src_a.borrow().clone(),
+                    Value::ExecutableArray(src_a) => (*src_a).clone(),
+                    _ => return Err(PsError::TypeCheck { expected: "array", got: src_val.type_name().to_string() }),
+                };
+                let mut dest = dest_arr.borrow_mut();
+                let copy_len = src_items.len().min(dest.len());
+                for i in 0..copy_len {
+                    dest[i] = src_items[i].clone();
+                }
+                self.operand_stack.push(Value::Array(dest_arr.clone()));
+            }
+            Value::Dict(dest_dict) => {
+                let src_val = self.pop_value()?;
+                let src_dict = match src_val {
+                    Value::Dict(d) => d,
+                    _ => return Err(PsError::TypeCheck { expected: "dict", got: src_val.type_name().to_string() }),
+                };
+                let pairs: Vec<(String, Value)> = src_dict.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                for (k, v) in pairs {
+                    dest_dict.borrow_mut().insert(k, v);
+                }
+                self.operand_stack.push(Value::Dict(dest_dict));
+            }
+            Value::String(mut dest_str) => {
+                let src_val = self.pop_value()?;
+                let src_bytes = match src_val {
+                    Value::String(s) => s,
+                    _ => return Err(PsError::TypeCheck { expected: "string", got: src_val.type_name().to_string() }),
+                };
+                let copy_len = src_bytes.len().min(dest_str.len());
+                dest_str[..copy_len].copy_from_slice(&src_bytes[..copy_len]);
+                self.operand_stack.push(Value::String(dest_str));
+            }
+            _ => return Err(PsError::TypeCheck { expected: "integer, array, dict, or string", got: top.type_name().to_string() }),
         }
-        let items = self.operand_stack[len - count..].to_vec();
-        self.operand_stack.extend(items);
         Ok(())
     }
 
@@ -1447,6 +1760,17 @@ impl Interpreter {
         Err(PsError::TypeCheck { expected: "6-element array matrix", got: "other".to_string() })
     }
 
+    fn get_current_point_user(&self) -> Option<(f64, f64)> {
+        let (dx, dy) = self.current_gstate.current_point?;
+        let inv = self.current_gstate.ctm.inverse().unwrap_or(Matrix2D::identity());
+        Some(inv.transform_point(dx, dy))
+    }
+
+    fn set_current_point_user(&mut self, ux: f64, uy: f64) {
+        let (dx, dy) = self.current_gstate.ctm.transform_point(ux, uy);
+        self.current_gstate.current_point = Some((dx, dy));
+    }
+
     fn matrix_to_val(&self, m: Matrix2D) -> Value {
         Value::new_array(vec![
             Value::Real(m.a),
@@ -1457,4 +1781,31 @@ impl Interpreter {
             Value::Real(m.ty),
         ])
     }
+}
+
+fn format_radix(val: i64, radix: u32) -> String {
+    if radix < 2 || radix > 36 {
+        return val.to_string();
+    }
+    if val == 0 {
+        return "0".to_string();
+    }
+    let is_neg = val < 0;
+    let mut u = val.unsigned_abs();
+    let mut chars = Vec::new();
+    while u > 0 {
+        let digit = (u % (radix as u64)) as u8;
+        let c = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'A' + (digit - 10)
+        };
+        chars.push(c);
+        u /= radix as u64;
+    }
+    if is_neg {
+        chars.push(b'-');
+    }
+    chars.reverse();
+    String::from_utf8_lossy(&chars).to_string()
 }
