@@ -474,7 +474,10 @@ impl Interpreter {
                 }
             }
             "where" => {
-                let key = self.pop_key_name()?;
+                let mut key = self.pop_key_name()?;
+                if key.starts_with("//") {
+                    key = key.trim_start_matches('/').to_string();
+                }
                 let mut found_dict = None;
                 for dict in self.dict_stack.iter().rev() {
                     if dict.borrow().contains_key(&key) {
@@ -490,11 +493,14 @@ impl Interpreter {
                 }
             }
             "load" => {
-                let key = self.pop_key_name()?;
+                let mut key = self.pop_key_name()?;
+                if key.starts_with("//") {
+                    key = key.trim_start_matches('/').to_string();
+                }
                 if let Some(val) = self.lookup_dict(&key) {
                     self.operand_stack.push(val);
                 } else {
-                    return Err(PsError::Undefined(format!("/{}", key)));
+                    self.operand_stack.push(Value::Name(key));
                 }
             }
             "countdictstack" => {
@@ -1213,11 +1219,19 @@ impl Interpreter {
             // Font operators
             "findfont" => {
                 let name = self.pop_key_name()?;
-                let base_font = self.font_directory.get(&name)
+                let base_font = if let Some(f) = self.font_directory.get(&name)
                     .or_else(|| self.font_directory.get(&name.to_uppercase()))
                     .or_else(|| self.font_directory.get(&name.to_lowercase()))
-                    .cloned()
-                    .unwrap_or_else(|| FontFace::new(&name));
+                {
+                    if f.charstrings.is_empty() {
+                        crate::font::load_font_by_name(&name).unwrap_or_else(|| f.clone())
+                    } else {
+                        f.clone()
+                    }
+                } else {
+                    crate::font::load_font_by_name(&name).unwrap_or_else(|| FontFace::new(&name))
+                };
+                self.font_directory.insert(name.clone(), base_font.clone());
                 self.font_instances.push(base_font.clone());
                 let font_id = self.font_instances.len() - 1;
                 let dict = Rc::new(RefCell::new(HashMap::new()));

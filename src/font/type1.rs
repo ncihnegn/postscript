@@ -1,5 +1,6 @@
-use crate::error::PsResult;
+use crate::error::{PsError, PsResult};
 use crate::font::charstring::{CharStringInterpreter, GlyphOutline};
+use crate::font::eexec::Type1Cipher;
 use std::collections::HashMap;
 
 pub struct Type1Parser;
@@ -72,6 +73,59 @@ impl Type1Parser {
         }
 
         Ok((subrs, charstrings))
+    }
+
+    pub fn parse_pfb(data: &[u8]) -> PsResult<(String, Vec<String>, Vec<Vec<u8>>, HashMap<String, GlyphOutline>)> {
+        let mut pos = 0;
+        let mut ascii_header = Vec::new();
+        let mut binary_eexec = Vec::new();
+
+        while pos + 6 <= data.len() && data[pos] == 0x80 {
+            let seg_type = data[pos + 1];
+            if seg_type == 3 {
+                break;
+            }
+            let seg_len = (data[pos + 2] as usize)
+                | ((data[pos + 3] as usize) << 8)
+                | ((data[pos + 4] as usize) << 16)
+                | ((data[pos + 5] as usize) << 24);
+            pos += 6;
+            if pos + seg_len > data.len() {
+                break;
+            }
+            let seg_data = &data[pos..pos + seg_len];
+            if seg_type == 1 {
+                ascii_header.extend_from_slice(seg_data);
+            } else if seg_type == 2 {
+                binary_eexec.extend_from_slice(seg_data);
+            }
+            pos += seg_len;
+        }
+
+        if binary_eexec.is_empty() {
+            return Err(PsError::SyntaxError("No eexec segment in PFB".to_string()));
+        }
+
+        let mut cipher = Type1Cipher::new_eexec();
+        let decrypted = cipher.decrypt(&binary_eexec, 4);
+        let (subrs, charstrings) = Self::parse_eexec_data(&decrypted, "")?;
+
+        let font_name = if let Some(fn_pos) = Self::find_bytes(&ascii_header, b"/FontName") {
+            let mut p = fn_pos + 9;
+            while p < ascii_header.len() && (ascii_header[p] == b' ' || ascii_header[p] == b'/') {
+                p += 1;
+            }
+            Self::read_name(&ascii_header, &mut p)
+        } else {
+            "unnamed".to_string()
+        };
+
+        let mut encoding = vec![".notdef".to_string(); 256];
+        for i in 32..=126 {
+            encoding[i] = (i as u8 as char).to_string();
+        }
+
+        Ok((font_name, encoding, subrs, charstrings))
     }
 
     fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
