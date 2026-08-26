@@ -54,74 +54,96 @@ impl DscDocument {
 
         let mut current_page: Option<(String, usize, usize)> = None;
 
+        let mut nesting_depth: usize = 0;
+
         let mut offset = 0;
         for line in text.split_inclusive('\n') {
             let line_len = line.len();
             let trimmed = line.trim();
 
-            if trimmed.starts_with("%%Title:") {
-                title = Some(trimmed["%%Title:".len()..].trim().to_string());
-            } else if trimmed.starts_with("%%Creator:") {
-                creator = Some(trimmed["%%Creator:".len()..].trim().to_string());
-            } else if trimmed.starts_with("%%BoundingBox:") {
-                let parts: Vec<&str> = trimmed["%%BoundingBox:".len()..].split_whitespace().collect();
-                if parts.len() == 4 {
-                    if let (Ok(x1), Ok(y1), Ok(x2), Ok(y2)) = (
-                        parts[0].parse::<f64>(),
-                        parts[1].parse::<f64>(),
-                        parts[2].parse::<f64>(),
-                        parts[3].parse::<f64>(),
-                    ) {
-                        bounding_box = Some(BoundingBox { llx: x1, lly: y1, urx: x2, ury: y2 });
+            if trimmed.starts_with("%%BeginDocument")
+                || trimmed.starts_with("%%BeginFont")
+                || trimmed.starts_with("%%BeginFeature")
+                || trimmed.starts_with("%%BeginFile")
+                || trimmed.starts_with("%%BeginData")
+                || trimmed.starts_with("%%BeginProcSet")
+            {
+                nesting_depth += 1;
+            } else if trimmed.starts_with("%%EndDocument")
+                || trimmed.starts_with("%%EndFont")
+                || trimmed.starts_with("%%EndFeature")
+                || trimmed.starts_with("%%EndFile")
+                || trimmed.starts_with("%%EndData")
+                || trimmed.starts_with("%%EndProcSet")
+            {
+                if nesting_depth > 0 {
+                    nesting_depth -= 1;
+                }
+            } else if nesting_depth == 0 {
+                if trimmed.starts_with("%%Title:") && title.is_none() {
+                    title = Some(trimmed["%%Title:".len()..].trim().to_string());
+                } else if trimmed.starts_with("%%Creator:") && creator.is_none() {
+                    creator = Some(trimmed["%%Creator:".len()..].trim().to_string());
+                } else if trimmed.starts_with("%%BoundingBox:") && bounding_box.is_none() {
+                    let parts: Vec<&str> = trimmed["%%BoundingBox:".len()..].split_whitespace().collect();
+                    if parts.len() == 4 {
+                        if let (Ok(x1), Ok(y1), Ok(x2), Ok(y2)) = (
+                            parts[0].parse::<f64>(),
+                            parts[1].parse::<f64>(),
+                            parts[2].parse::<f64>(),
+                            parts[3].parse::<f64>(),
+                        ) {
+                            bounding_box = Some(BoundingBox { llx: x1, lly: y1, urx: x2, ury: y2 });
+                        }
                     }
-                }
-            } else if trimmed.starts_with("%%HiResBoundingBox:") {
-                let parts: Vec<&str> = trimmed["%%HiResBoundingBox:".len()..].split_whitespace().collect();
-                if parts.len() == 4 {
-                    if let (Ok(x1), Ok(y1), Ok(x2), Ok(y2)) = (
-                        parts[0].parse::<f64>(),
-                        parts[1].parse::<f64>(),
-                        parts[2].parse::<f64>(),
-                        parts[3].parse::<f64>(),
-                    ) {
-                        hires_bounding_box = Some(BoundingBox { llx: x1, lly: y1, urx: x2, ury: y2 });
+                } else if trimmed.starts_with("%%HiResBoundingBox:") && hires_bounding_box.is_none() {
+                    let parts: Vec<&str> = trimmed["%%HiResBoundingBox:".len()..].split_whitespace().collect();
+                    if parts.len() == 4 {
+                        if let (Ok(x1), Ok(y1), Ok(x2), Ok(y2)) = (
+                            parts[0].parse::<f64>(),
+                            parts[1].parse::<f64>(),
+                            parts[2].parse::<f64>(),
+                            parts[3].parse::<f64>(),
+                        ) {
+                            hires_bounding_box = Some(BoundingBox { llx: x1, lly: y1, urx: x2, ury: y2 });
+                        }
                     }
-                }
-            } else if trimmed.starts_with("%%Pages:") {
-                let p = trimmed["%%Pages:".len()..].trim();
-                if let Ok(n) = p.parse::<usize>() {
-                    total_pages = Some(n);
-                }
-            } else if trimmed.starts_with("%%BeginProlog") {
-                prolog_start = Some(offset);
-            } else if trimmed.starts_with("%%EndProlog") {
-                prolog_end = Some(offset + line_len);
-            } else if trimmed.starts_with("%%BeginSetup") {
-                setup_start = Some(offset);
-            } else if trimmed.starts_with("%%EndSetup") {
-                setup_end = Some(offset + line_len);
-            } else if trimmed.starts_with("%%Page:") {
-                if let Some((label, ord, start)) = current_page.take() {
-                    pages.push(DscPage {
-                        label,
-                        ordinal: ord,
-                        start_byte_offset: start,
-                        end_byte_offset: offset,
-                    });
-                }
+                } else if trimmed.starts_with("%%Pages:") {
+                    let p = trimmed["%%Pages:".len()..].trim();
+                    if let Ok(n) = p.parse::<usize>() {
+                        total_pages = Some(n);
+                    }
+                } else if trimmed.starts_with("%%BeginProlog") {
+                    prolog_start = Some(offset);
+                } else if trimmed.starts_with("%%EndProlog") {
+                    prolog_end = Some(offset + line_len);
+                } else if trimmed.starts_with("%%BeginSetup") {
+                    setup_start = Some(offset);
+                } else if trimmed.starts_with("%%EndSetup") {
+                    setup_end = Some(offset + line_len);
+                } else if trimmed.starts_with("%%Page:") {
+                    if let Some((label, ord, start)) = current_page.take() {
+                        pages.push(DscPage {
+                            label,
+                            ordinal: ord,
+                            start_byte_offset: start,
+                            end_byte_offset: offset,
+                        });
+                    }
 
-                let parts: Vec<&str> = trimmed["%%Page:".len()..].split_whitespace().collect();
-                let label = parts.first().unwrap_or(&"?").to_string();
-                let ord = parts.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(pages.len() + 1);
-                current_page = Some((label, ord, offset));
-            } else if trimmed.starts_with("%%Trailer") || trimmed.starts_with("%%EOF") {
-                if let Some((label, ord, start)) = current_page.take() {
-                    pages.push(DscPage {
-                        label,
-                        ordinal: ord,
-                        start_byte_offset: start,
-                        end_byte_offset: offset,
-                    });
+                    let parts: Vec<&str> = trimmed["%%Page:".len()..].split_whitespace().collect();
+                    let label = parts.first().unwrap_or(&"?").to_string();
+                    let ord = parts.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(pages.len() + 1);
+                    current_page = Some((label, ord, offset));
+                } else if trimmed.starts_with("%%Trailer") || trimmed.starts_with("%%EOF") {
+                    if let Some((label, ord, start)) = current_page.take() {
+                        pages.push(DscPage {
+                            label,
+                            ordinal: ord,
+                            start_byte_offset: start,
+                            end_byte_offset: offset,
+                        });
+                    }
                 }
             }
 

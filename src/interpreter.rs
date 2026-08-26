@@ -10,6 +10,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+#[derive(Clone)]
+pub struct SaveSnapshot {
+    pub id: u64,
+    pub dicts: Vec<(Rc<RefCell<HashMap<String, Value>>>, HashMap<String, Value>)>,
+    pub current_gstate: GraphicsState,
+    pub gstate_stack: Vec<GraphicsState>,
+}
+
 pub struct Interpreter {
     pub operand_stack: Vec<Value>,
     pub dict_stack: Vec<Rc<RefCell<HashMap<String, Value>>>>,
@@ -19,6 +27,9 @@ pub struct Interpreter {
     pub render_target: RenderTarget,
     pub pages_rendered: Vec<RenderTarget>,
     pub initial_ctm: Matrix2D,
+    pub save_stack: Vec<SaveSnapshot>,
+    pub next_save_id: u64,
+    pub font_instances: Vec<FontFace>,
 }
 
 impl Interpreter {
@@ -43,6 +54,9 @@ impl Interpreter {
             render_target: RenderTarget::new(pixel_w, pixel_h),
             pages_rendered: Vec::new(),
             initial_ctm,
+            save_stack: Vec::with_capacity(8),
+            next_save_id: 1,
+            font_instances: Vec::with_capacity(32),
         };
 
         // Initialize systemdict and userdict
@@ -153,14 +167,7 @@ impl Interpreter {
     }
 
     pub fn execute_name(&mut self, name: &str, lexer: &mut Lexer) -> PsResult<()> {
-        // Built-in operators dispatch
-        match self.dispatch_builtin(name, lexer) {
-            Ok(true) => return Ok(()),
-            Err(e) => return Err(PsError::SyntaxError(format!("operator '{}' failed: {}", name, e))),
-            Ok(false) => {}
-        }
-
-        // Look up name in dictionary stack
+        // 1. Look up name in dictionary stack
         if let Some(val) = self.lookup_dict(name) {
             match val {
                 Value::ExecutableArray(proc) => {
@@ -168,15 +175,28 @@ impl Interpreter {
                     for item in items.iter() {
                         self.eval_value(item.clone(), lexer)?;
                     }
+                    return Ok(());
+                }
+                Value::Name(alias) => {
+                    if alias != name {
+                        return self.execute_name(&alias, lexer);
+                    }
                 }
                 other => {
                     self.operand_stack.push(other);
+                    return Ok(());
                 }
             }
-            return Ok(());
         }
 
-        // Ignore unknown pdfmark/BDC or DSC directives safely
+        // 2. Built-in operators dispatch
+        match self.dispatch_builtin(name, lexer) {
+            Ok(true) => return Ok(()),
+            Err(e) => return Err(PsError::SyntaxError(format!("operator '{}' failed: {}", name, e))),
+            Ok(false) => {}
+        }
+
+        // 3. Ignore unknown pdfmark/BDC or DSC directives safely
         if name.ends_with("mark") || name == "BDC" || name == "EMC" || name == "pdfmark" {
             // pdfmark takes a mark and pops to mark
             self.op_cleartomark().ok();
@@ -381,7 +401,12 @@ impl Interpreter {
                         let val = arr.get(idx).cloned().ok_or_else(|| PsError::RangeCheck("array index out of bounds".to_string()))?;
                         self.operand_stack.push(val);
                     }
-                    _ => return Err(PsError::TypeCheck { expected: "dict or array", got: container.type_name().to_string() }),
+                    Value::String(s) => {
+                        let idx = key_or_index.as_i64()? as usize;
+                        let val = s.get(idx).copied().ok_or_else(|| PsError::RangeCheck("string index out of bounds".to_string()))?;
+                        self.operand_stack.push(Value::Integer(val as i64));
+                    }
+                    _ => return Err(PsError::TypeCheck { expected: "dict, array or string", got: container.type_name().to_string() }),
                 }
             }
             "put" => {
@@ -409,6 +434,21 @@ impl Interpreter {
                         }
                     }
                     _ => return Err(PsError::TypeCheck { expected: "dict or array", got: container.type_name().to_string() }),
+                }
+            }
+            "store" => {
+                let val = self.pop_value()?;
+                let key = self.pop_key_name()?;
+                let mut found = false;
+                for dict in self.dict_stack.iter().rev() {
+                    if dict.borrow().contains_key(&key) {
+                        dict.borrow_mut().insert(key.clone(), val.clone());
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    self.def_in_current_dict(key, val)?;
                 }
             }
             "currentdict" => {
@@ -478,6 +518,127 @@ impl Interpreter {
                     return Err(PsError::TypeCheck { expected: "array", got: val.type_name().to_string() });
                 }
             }
+            "string" => {
+                let len = self.pop_i64()? as usize;
+                self.operand_stack.push(Value::String(vec![0; len]));
+            }
+            "getinterval" => {
+                let count = self.pop_i64()? as usize;
+                let index = self.pop_i64()? as usize;
+                let container = self.pop_value()?;
+                match container {
+                    Value::Array(a) => {
+                        let arr = a.borrow();
+                        let sub = arr.iter().skip(index).take(count).cloned().collect();
+                        self.operand_stack.push(Value::new_array(sub));
+                    }
+                    Value::String(s) => {
+                        let sub = s.into_iter().skip(index).take(count).collect();
+                        self.operand_stack.push(Value::String(sub));
+                    }
+                    _ => return Err(PsError::TypeCheck { expected: "array or string", got: container.type_name().to_string() }),
+                }
+            }
+            "putinterval" => {
+                let sub_val = self.pop_value()?;
+                let index = self.pop_i64()? as usize;
+                let container = self.pop_value()?;
+                match (container, sub_val) {
+                    (Value::Array(a), Value::Array(sub)) => {
+                        let mut arr = a.borrow_mut();
+                        let sub_arr = sub.borrow();
+                        for (i, item) in sub_arr.iter().enumerate() {
+                            if index + i < arr.len() {
+                                arr[index + i] = item.clone();
+                            } else {
+                                arr.push(item.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "readhexstring" => {
+                let str_buf = self.pop_value()?;
+                let _file = self.pop_value().ok();
+                let len = match &str_buf {
+                    Value::String(s) => s.len(),
+                    _ => 0,
+                };
+                let (hex_bytes, not_eof) = lexer.read_hex_bytes(len);
+                self.operand_stack.push(Value::String(hex_bytes));
+                self.operand_stack.push(Value::Bool(not_eof));
+            }
+            "image" => {
+                let proc = self.pop_value()?;
+                let _mat_val = self.pop_value()?;
+                let _bits = self.pop_num()?;
+                let h = self.pop_num().unwrap_or(1.0) as usize;
+                let w = self.pop_num().unwrap_or(1.0) as usize;
+                let total_needed = w * h;
+                let mut bytes_read = 0;
+                while bytes_read < total_needed {
+                    self.execute_proc_value(proc.clone(), lexer)?;
+                    if let Ok(val) = self.pop_value() {
+                        match val {
+                            Value::String(s) => {
+                                if s.is_empty() {
+                                    break;
+                                }
+                                bytes_read += s.len();
+                            }
+                            _ => break,
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // Type & Conversion
+            "type" => {
+                let val = self.pop_value()?;
+                let t_name = match val {
+                    Value::Integer(_) => "integertype",
+                    Value::Real(_) => "realtype",
+                    Value::Bool(_) => "booleantype",
+                    Value::String(_) => "stringtype",
+                    Value::LiteralName(_) | Value::Name(_) => "nametype",
+                    Value::Dict(_) => "dicttype",
+                    Value::Array(_) | Value::ExecutableArray(_) => "arraytype",
+                    Value::Mark => "marktype",
+                    Value::Null => "nulltype",
+                };
+                self.operand_stack.push(Value::LiteralName(t_name.to_string()));
+            }
+            "cvn" => {
+                let val = self.pop_value()?;
+                let name = val.as_str_lossy();
+                self.operand_stack.push(Value::LiteralName(name));
+            }
+            "cvi" => {
+                let val = self.pop_value()?;
+                let i = val.as_i64()?;
+                self.operand_stack.push(Value::Integer(i));
+            }
+            "cvr" => {
+                let val = self.pop_value()?;
+                let r = val.as_f64()?;
+                self.operand_stack.push(Value::Real(r));
+            }
+            "cvs" => {
+                let _str_buf = self.pop_value()?;
+                let val = self.pop_value()?;
+                let s = match val {
+                    Value::Integer(i) => i.to_string(),
+                    Value::Real(r) => r.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    Value::String(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                    Value::LiteralName(n) | Value::Name(n) => n,
+                    _ => "".to_string(),
+                };
+                self.operand_stack.push(Value::String(s.into_bytes()));
+            }
 
             // Control flow
             "if" => {
@@ -546,10 +707,32 @@ impl Interpreter {
                 // Optimization / no-op in interpreter
             }
             "save" => {
-                self.operand_stack.push(Value::Integer(1));
+                let id = self.next_save_id;
+                self.next_save_id += 1;
+                let mut dicts = Vec::new();
+                for d in &self.dict_stack {
+                    dicts.push((d.clone(), d.borrow().clone()));
+                }
+                self.save_stack.push(SaveSnapshot {
+                    id,
+                    dicts,
+                    current_gstate: self.current_gstate.clone(),
+                    gstate_stack: self.gstate_stack.clone(),
+                });
+                self.operand_stack.push(Value::Integer(id as i64));
             }
             "restore" => {
-                self.pop_value().ok();
+                let val = self.pop_value()?;
+                let save_id = val.as_i64().unwrap_or(0) as u64;
+                if let Some(pos) = self.save_stack.iter().rposition(|s| s.id == save_id) {
+                    let snapshot = self.save_stack.remove(pos);
+                    self.save_stack.truncate(pos);
+                    for (dict_rc, saved_map) in snapshot.dicts {
+                        *dict_rc.borrow_mut() = saved_map;
+                    }
+                    self.current_gstate = snapshot.current_gstate;
+                    self.gstate_stack = snapshot.gstate_stack;
+                }
             }
             "readonly" | "executeonly" | "noaccess" => {
                 // Return same object unchanged
@@ -852,38 +1035,82 @@ impl Interpreter {
             // Font operators
             "findfont" => {
                 let name = self.pop_key_name()?;
-                let _font = self.font_directory.get(&name).cloned().unwrap_or_else(|| FontFace::new(&name));
+                let base_font = self.font_directory.get(&name)
+                    .or_else(|| self.font_directory.get(&name.to_uppercase()))
+                    .or_else(|| self.font_directory.get(&name.to_lowercase()))
+                    .cloned()
+                    .unwrap_or_else(|| FontFace::new(&name));
+                self.font_instances.push(base_font);
+                let font_id = self.font_instances.len() - 1;
                 let dict = Rc::new(RefCell::new(HashMap::new()));
                 dict.borrow_mut().insert("FontName".to_string(), Value::LiteralName(name));
+                dict.borrow_mut().insert("_FontId".to_string(), Value::Integer(font_id as i64));
                 self.operand_stack.push(Value::Dict(dict));
             }
             "scalefont" => {
                 let scale = self.pop_num()?;
                 let font_dict = self.pop_dict()?;
-                let font_name = font_dict.borrow().get("FontName").map(|v| v.as_str_lossy()).unwrap_or_default();
-                let font = self.font_directory.get(&font_name).cloned().unwrap_or_else(|| FontFace::new(&font_name));
+                let font_id = font_dict.borrow().get("_FontId").and_then(|v| v.as_i64().ok()).map(|i| i as usize);
+                let font = if let Some(id) = font_id {
+                    self.font_instances.get(id).cloned()
+                } else {
+                    let font_name = font_dict.borrow().get("FontName").map(|v| v.as_str_lossy()).unwrap_or_default();
+                    self.font_directory.get(&font_name)
+                        .or_else(|| self.font_directory.get(&font_name.to_uppercase()))
+                        .or_else(|| self.font_directory.get(&font_name.to_lowercase()))
+                        .cloned()
+                }.unwrap_or_else(|| FontFace::new("default"));
                 let scaled_font = font.scalefont(scale);
-                self.font_directory.insert(font_name.clone(), scaled_font);
-                self.operand_stack.push(Value::Dict(font_dict));
+                self.font_instances.push(scaled_font);
+                let new_id = self.font_instances.len() - 1;
+                let new_dict = Rc::new(RefCell::new(font_dict.borrow().clone()));
+                new_dict.borrow_mut().insert("_FontId".to_string(), Value::Integer(new_id as i64));
+                self.operand_stack.push(Value::Dict(new_dict));
             }
             "makefont" => {
                 let mat_val = self.pop_value()?;
                 let mat = self.val_to_matrix(mat_val)?;
                 let font_dict = self.pop_dict()?;
-                let font_name = font_dict.borrow().get("FontName").map(|v| v.as_str_lossy()).unwrap_or_default();
-                let font = self.font_directory.get(&font_name).cloned().unwrap_or_else(|| FontFace::new(&font_name));
+                let font_id = font_dict.borrow().get("_FontId").and_then(|v| v.as_i64().ok()).map(|i| i as usize);
+                let font = if let Some(id) = font_id {
+                    self.font_instances.get(id).cloned()
+                } else {
+                    let font_name = font_dict.borrow().get("FontName").map(|v| v.as_str_lossy()).unwrap_or_default();
+                    self.font_directory.get(&font_name)
+                        .or_else(|| self.font_directory.get(&font_name.to_uppercase()))
+                        .or_else(|| self.font_directory.get(&font_name.to_lowercase()))
+                        .cloned()
+                }.unwrap_or_else(|| FontFace::new("default"));
                 let made_font = font.makefont(mat);
-                self.font_directory.insert(font_name.clone(), made_font);
-                self.operand_stack.push(Value::Dict(font_dict));
+                self.font_instances.push(made_font);
+                let new_id = self.font_instances.len() - 1;
+                let new_dict = Rc::new(RefCell::new(font_dict.borrow().clone()));
+                new_dict.borrow_mut().insert("_FontId".to_string(), Value::Integer(new_id as i64));
+                self.operand_stack.push(Value::Dict(new_dict));
             }
             "setfont" => {
                 let font_val = self.pop_value()?;
-                let font_name = match font_val {
-                    Value::Dict(d) => d.borrow().get("FontName").map(|v| v.as_str_lossy()).unwrap_or_default(),
-                    Value::LiteralName(n) | Value::Name(n) => n,
-                    _ => "".to_string(),
-                };
-                let font = self.font_directory.get(&font_name).cloned().unwrap_or_else(|| FontFace::new(&font_name));
+                let font = match font_val {
+                    Value::Dict(d) => {
+                        let font_id = d.borrow().get("_FontId").and_then(|v| v.as_i64().ok()).map(|i| i as usize);
+                        if let Some(id) = font_id {
+                            self.font_instances.get(id).cloned()
+                        } else {
+                            let font_name = d.borrow().get("FontName").map(|v| v.as_str_lossy()).unwrap_or_default();
+                            self.font_directory.get(&font_name)
+                                .or_else(|| self.font_directory.get(&font_name.to_uppercase()))
+                                .or_else(|| self.font_directory.get(&font_name.to_lowercase()))
+                                .cloned()
+                        }
+                    }
+                    Value::LiteralName(n) | Value::Name(n) => {
+                        self.font_directory.get(&n)
+                            .or_else(|| self.font_directory.get(&n.to_uppercase()))
+                            .or_else(|| self.font_directory.get(&n.to_lowercase()))
+                            .cloned()
+                    }
+                    _ => None,
+                }.unwrap_or_else(|| FontFace::new("default"));
                 self.current_gstate.font = Some(font);
             }
             "charpath" => {

@@ -55,9 +55,21 @@ fn test_graphics_drawing() {
 }
 
 #[test]
-fn test_sh_ps_font_loading() {
-    let bytes = std::fs::read("/Users/ningchen/Temp/arXiv/math/9201303/sh.ps").unwrap();
-    let pixmap = postscript::render_ps_to_pixmap(&bytes, 0, 612 * 2, 792 * 2).unwrap();
-    assert_eq!(pixmap.width(), 1224);
-    assert_eq!(pixmap.height(), 1584);
+fn test_dancing_ps_page3() {
+    let bytes = std::fs::read("/Users/ningchen/Temp/arXiv/cs/0011047/dancing.ps").unwrap();
+    let dsc = postscript::DscDocument::parse(&bytes);
+    println!("Dsc total pages: {:?}, parsed pages count: {}", dsc.total_pages, dsc.pages.len());
+    let page3 = &dsc.pages[2];
+    println!("Page 3 label: {}, range: {}..{}", page3.label, page3.start_byte_offset, page3.end_byte_offset);
+    let mut interp = postscript::Interpreter::with_page_size(612.0, 792.0, 612 * 2, 792 * 2);
+    if let Some((start, end)) = dsc.preamble_range {
+        interp.execute_bytes(&bytes[start..end]).unwrap();
+    }
+    let page_bytes = &bytes[page3.start_byte_offset..page3.end_byte_offset];
+    let res = interp.execute_bytes(page_bytes);
+    println!("Page 3 execute result: {:?}", res);
+    println!("Page 3 draw commands count: {}", interp.render_target.commands.len());
+    for (i, cmd) in interp.render_target.commands.iter().take(20).enumerate() {
+        println!("  cmd {}: {:?}", i, cmd);
+    }
 }

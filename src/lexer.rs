@@ -38,6 +38,51 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    pub fn read_hex_bytes(&mut self, count: usize) -> (Vec<u8>, bool) {
+        let mut result = Vec::with_capacity(count);
+        let mut first_nibble = None;
+
+        while self.pos < self.input.len() && result.len() < count {
+            let b = self.input[self.pos];
+            self.pos += 1;
+
+            if b.is_ascii_whitespace() {
+                continue;
+            }
+            if b == b'%' {
+                while self.pos < self.input.len() && self.input[self.pos] != b'\n' && self.input[self.pos] != b'\r' {
+                    self.pos += 1;
+                }
+                continue;
+            }
+
+            let hex_val = match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                b'A'..=b'F' => b - b'A' + 10,
+                _ => {
+                    self.pos -= 1;
+                    break;
+                }
+            };
+
+            if let Some(first) = first_nibble.take() {
+                result.push((first << 4) | hex_val);
+            } else {
+                first_nibble = Some(hex_val);
+            }
+        }
+
+        if let Some(first) = first_nibble {
+            if result.len() < count {
+                result.push(first << 4);
+            }
+        }
+
+        let is_not_eof = self.pos < self.input.len();
+        (result, is_not_eof)
+    }
+
     pub fn next_token(&mut self) -> PsResult<Option<Token>> {
         self.skip_whitespace_and_comments();
         if self.pos >= self.input.len() {
