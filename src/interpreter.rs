@@ -278,6 +278,22 @@ impl Interpreter {
                 let base = self.pop_num()?;
                 self.operand_stack.push(Value::Real(base.powf(exp)));
             }
+            "truncate" => {
+                let val = self.pop_num()?;
+                self.operand_stack.push(Value::Real(val.trunc()));
+            }
+            "round" => {
+                let val = self.pop_num()?;
+                self.operand_stack.push(Value::Real(val.round()));
+            }
+            "floor" => {
+                let val = self.pop_num()?;
+                self.operand_stack.push(Value::Real(val.floor()));
+            }
+            "ceiling" => {
+                let val = self.pop_num()?;
+                self.operand_stack.push(Value::Real(val.ceil()));
+            }
 
             // Comparison & Boolean
             "eq" => {
@@ -761,6 +777,76 @@ impl Interpreter {
             "setmatrix" => {
                 let mat_val = self.pop_value()?;
                 self.current_gstate.ctm = self.val_to_matrix(mat_val)?;
+            }
+            "transform" => {
+                let val = self.pop_value()?;
+                let (x, y, mat) = if let Ok(m) = self.val_to_matrix(val.clone()) {
+                    let y = self.pop_num()?;
+                    let x = self.pop_num()?;
+                    (x, y, m)
+                } else {
+                    let y = val.as_f64()?;
+                    let x = self.pop_num()?;
+                    (x, y, self.current_gstate.ctm)
+                };
+                let (tx, ty) = mat.transform_point(x, y);
+                self.operand_stack.push(Value::Real(tx));
+                self.operand_stack.push(Value::Real(ty));
+            }
+            "itransform" => {
+                let val = self.pop_value()?;
+                let (x, y, mat) = if let Ok(m) = self.val_to_matrix(val.clone()) {
+                    let y = self.pop_num()?;
+                    let x = self.pop_num()?;
+                    (x, y, m)
+                } else {
+                    let y = val.as_f64()?;
+                    let x = self.pop_num()?;
+                    (x, y, self.current_gstate.ctm)
+                };
+                let inv = mat.inverse().unwrap_or(Matrix2D::identity());
+                let (tx, ty) = inv.transform_point(x, y);
+                self.operand_stack.push(Value::Real(tx));
+                self.operand_stack.push(Value::Real(ty));
+            }
+            "dtransform" => {
+                let val = self.pop_value()?;
+                let (dx, dy, mat) = if let Ok(m) = self.val_to_matrix(val.clone()) {
+                    let dy = self.pop_num()?;
+                    let dx = self.pop_num()?;
+                    (dx, dy, m)
+                } else {
+                    let dy = val.as_f64()?;
+                    let dx = self.pop_num()?;
+                    (dx, dy, self.current_gstate.ctm)
+                };
+                let (tdx, tdy) = mat.transform_vector(dx, dy);
+                self.operand_stack.push(Value::Real(tdx));
+                self.operand_stack.push(Value::Real(tdy));
+            }
+            "idtransform" => {
+                let val = self.pop_value()?;
+                let (dx, dy, mat) = if let Ok(m) = self.val_to_matrix(val.clone()) {
+                    let dy = self.pop_num()?;
+                    let dx = self.pop_num()?;
+                    (dx, dy, m)
+                } else {
+                    let dy = val.as_f64()?;
+                    let dx = self.pop_num()?;
+                    (dx, dy, self.current_gstate.ctm)
+                };
+                let inv = mat.inverse().unwrap_or(Matrix2D::identity());
+                let (tdx, tdy) = inv.transform_vector(dx, dy);
+                self.operand_stack.push(Value::Real(tdx));
+                self.operand_stack.push(Value::Real(tdy));
+            }
+            "setdash" => {
+                let _offset = self.pop_num()?;
+                let _array = self.pop_value()?;
+            }
+            "currentdash" => {
+                self.operand_stack.push(Value::new_array(vec![]));
+                self.operand_stack.push(Value::Integer(0));
             }
 
             // Font operators
