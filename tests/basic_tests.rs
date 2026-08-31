@@ -176,6 +176,22 @@ fn test_pattern_stub_preserves_pattern_and_rectfill_paints() {
 }
 
 #[test]
+fn test_winnt_pattern_fallback_paints_when_page_prolog_is_absent() {
+    let mut interp = Interpreter::new(100, 100);
+    interp
+        .execute_str(
+            "10 10 20 20 [0 0 0 false] [0.2 0.3 0.4 false] 8 8 <AA55> prf",
+        )
+        .unwrap();
+
+    let Some(DrawCommand::Fill { color, .. }) = interp.render_target.commands.last() else {
+        panic!("expected a fill command");
+    };
+    assert_eq!(*color, Color::rgb(0.2, 0.3, 0.4));
+    assert_eq!(interp.current_gstate.color, Color::BLACK);
+}
+
+#[test]
 fn test_path_coordinates_are_fixed_when_ctm_changes_before_painting() {
     let mut interp = Interpreter::new(200, 200);
     interp

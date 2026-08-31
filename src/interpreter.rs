@@ -896,25 +896,7 @@ impl Interpreter {
                         pattern
                             .get("BGnd")
                             .or_else(|| pattern.get("FGnd"))
-                            .and_then(|components| match components {
-                                Value::Array(values) => {
-                                    let values = values.borrow();
-                                    match values.as_slice() {
-                                        [gray, Value::Bool(true)] => {
-                                            gray.as_f64().ok().map(Color::gray)
-                                        }
-                                        [red, green, blue, Value::Bool(false)] => {
-                                            Some(Color::rgb(
-                                                red.as_f64().ok()?,
-                                                green.as_f64().ok()?,
-                                                blue.as_f64().ok()?,
-                                            ))
-                                        }
-                                        _ => None,
-                                    }
-                                }
-                                _ => None,
-                            })
+                            .and_then(Self::winnt_pattern_color)
                     };
                     if let Some(color) = color {
                         self.current_gstate.color = color;
@@ -1468,30 +1450,25 @@ impl Interpreter {
                 let width = self.pop_num()?;
                 let y = self.pop_num()?;
                 let x = self.pop_num()?;
-                let mut path = Path::new();
-                for (index, (x, y)) in [
-                    (x, y),
-                    (x + width, y),
-                    (x + width, y + height),
-                    (x, y + height),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let (x, y) = self.current_gstate.ctm.transform_point(x, y);
-                    if index == 0 {
-                        path.move_to(x, y);
-                    } else {
-                        path.line_to(x, y);
-                    }
+                self.fill_rect(x, y, width, height);
+            }
+            "prf" => {
+                let _pattern_data = self.pop_value()?;
+                let _pattern_width = self.pop_num()?;
+                let _pattern_height = self.pop_num()?;
+                let background = self.pop_value()?;
+                let _foreground = self.pop_value()?;
+                let height = self.pop_num()?;
+                let width = self.pop_num()?;
+                let y = self.pop_num()?;
+                let x = self.pop_num()?;
+
+                let saved_color = self.current_gstate.color;
+                if let Some(color) = Self::winnt_pattern_color(&background) {
+                    self.current_gstate.color = color;
                 }
-                path.close_path();
-                self.render_target.push_fill(
-                    path,
-                    self.current_gstate.color,
-                    false,
-                    self.current_gstate.clip_paths.clone(),
-                );
+                self.fill_rect(x, y, width, height);
+                self.current_gstate.color = saved_color;
             }
             "clip" | "eoclip" => {
                 if !self.current_gstate.current_path.is_empty() {
@@ -2131,6 +2108,49 @@ impl Interpreter {
 
     fn pop_value(&mut self) -> PsResult<Value> {
         self.operand_stack.pop().ok_or(PsError::StackUnderflow)
+    }
+
+    fn winnt_pattern_color(value: &Value) -> Option<Color> {
+        let Value::Array(values) = value else {
+            return None;
+        };
+        let values = values.borrow();
+        match values.as_slice() {
+            [gray, Value::Bool(true)] => gray.as_f64().ok().map(Color::gray),
+            [red, green, blue, Value::Bool(false)] => Some(Color::rgb(
+                red.as_f64().ok()?,
+                green.as_f64().ok()?,
+                blue.as_f64().ok()?,
+            )),
+            _ => None,
+        }
+    }
+
+    fn fill_rect(&mut self, x: f64, y: f64, width: f64, height: f64) {
+        let mut path = Path::new();
+        for (index, (x, y)) in [
+            (x, y),
+            (x + width, y),
+            (x + width, y + height),
+            (x, y + height),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (x, y) = self.current_gstate.ctm.transform_point(x, y);
+            if index == 0 {
+                path.move_to(x, y);
+            } else {
+                path.line_to(x, y);
+            }
+        }
+        path.close_path();
+        self.render_target.push_fill(
+            path,
+            self.current_gstate.color,
+            false,
+            self.current_gstate.clip_paths.clone(),
+        );
     }
 
     fn pop_num(&mut self) -> PsResult<f64> {
