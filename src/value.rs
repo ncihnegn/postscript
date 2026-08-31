@@ -14,7 +14,7 @@ pub enum Value {
     LiteralName(String), // literal name: /Foo, /Times-Roman, etc.
     ImmediateName(String), // immediately resolved name: //Foo
     Array(Rc<RefCell<Vec<Value>>>),
-    ExecutableArray(Rc<Vec<Value>>), // { ... } procedure block
+    ExecutableArray(Rc<RefCell<Vec<Value>>>), // { ... } procedure block
     Dict(Rc<RefCell<HashMap<String, Value>>>),
     Mark,
     Null,
@@ -48,7 +48,7 @@ impl Value {
     }
 
     pub fn new_proc(items: Vec<Value>) -> Self {
-        Value::ExecutableArray(Rc::new(items))
+        Value::ExecutableArray(Rc::new(RefCell::new(items)))
     }
 
     pub fn new_dict() -> Self {
@@ -126,7 +126,7 @@ impl fmt::Debug for Value {
             Value::LiteralName(n) => write!(f, "/{}", n),
             Value::ImmediateName(n) => write!(f, "//{}", n),
             Value::Array(a) => write!(f, "{:?}", a.borrow()),
-            Value::ExecutableArray(a) => write!(f, "{{{:?}}}", a),
+            Value::ExecutableArray(a) => write!(f, "{{{:?}}}", a.borrow()),
             Value::Dict(d) => write!(f, "<<dict: {} entries>>", d.borrow().len()),
             Value::Mark => write!(f, "-mark-"),
             Value::Null => write!(f, "null"),
@@ -145,7 +145,7 @@ impl fmt::Display for Value {
             Value::LiteralName(n) => write!(f, "/{}", n),
             Value::ImmediateName(n) => write!(f, "//{}", n),
             Value::Array(a) => write!(f, "[array: {}]", a.borrow().len()),
-            Value::ExecutableArray(a) => write!(f, "{{proc: {} ops}}", a.len()),
+            Value::ExecutableArray(a) => write!(f, "{{proc: {} ops}}", a.borrow().len()),
             Value::Dict(d) => write!(f, "<dict:{}>", d.borrow().len()),
             Value::Mark => write!(f, "-mark-"),
             Value::Null => write!(f, "null"),

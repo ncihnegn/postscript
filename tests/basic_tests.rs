@@ -44,6 +44,46 @@ fn test_roll_and_string_put() {
 }
 
 #[test]
+fn test_executable_array_put_updates_loaded_procedure() {
+    let mut interp = Interpreter::new(100, 100);
+    interp
+        .execute_str("/proc { 1 } def /proc load 0 42 put proc")
+        .unwrap();
+
+    assert_eq!(interp.operand_stack, vec![Value::Integer(42)]);
+}
+
+#[test]
+fn test_type3_font_show_renders_bitmap_glyphs() {
+    let mut interp = Interpreter::new(100, 100);
+    interp
+        .execute_str(
+            "
+            /BitmapFont 10 dict dup begin
+            /FontType 3 def
+            /FontMatrix [1 0 0 1 0 0] def
+            /Encoding 256 array def
+            0 1 255 { Encoding exch /.notdef put } for
+            Encoding 65 /A put
+            /CD 1 dict def
+            CD /A [10 0 8 8 0 8 8 0 0 <8000000000000000>] put
+            end
+            /BitmapFont exch definefont pop
+            /BitmapFont findfont 1 scalefont setfont
+            10 10 moveto
+            (A) show
+            ",
+        )
+        .unwrap();
+
+    assert!(interp
+        .render_target
+        .commands
+        .iter()
+        .any(|command| matches!(command, DrawCommand::Image { width: 8, height: 8, .. })));
+}
+
+#[test]
 fn test_stopped_catches_errors_and_stop() {
     let mut interp = Interpreter::new(100, 100);
     interp.execute_str("7 { 2 3 add } stopped").unwrap();

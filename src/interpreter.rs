@@ -225,9 +225,9 @@ impl Interpreter {
         if let Some(val) = self.lookup_dict(name) {
             match val {
                 Value::ExecutableArray(proc) => {
-                    let items = proc.clone();
-                    for item in items.iter() {
-                        self.eval_value(item.clone(), lexer)?;
+                    let items = proc.borrow().clone();
+                    for item in items {
+                        self.eval_value(item, lexer)?;
                     }
                     return Ok(());
                 }
@@ -502,6 +502,12 @@ impl Interpreter {
                         let val = arr.get(idx).cloned().ok_or_else(|| PsError::RangeCheck("array index out of bounds".to_string()))?;
                         self.operand_stack.push(val);
                     }
+                    Value::ExecutableArray(a) => {
+                        let idx = key_or_index.as_i64()? as usize;
+                        let arr = a.borrow();
+                        let val = arr.get(idx).cloned().ok_or_else(|| PsError::RangeCheck("array index out of bounds".to_string()))?;
+                        self.operand_stack.push(val);
+                    }
                     Value::String(s) => {
                         let idx = key_or_index.as_i64()? as usize;
                         let val = s.get(idx).copied().ok_or_else(|| PsError::RangeCheck("string index out of bounds".to_string()))?;
@@ -532,6 +538,15 @@ impl Interpreter {
                             arr[idx] = val;
                         } else if idx == arr.len() {
                             arr.push(val);
+                        } else {
+                            return Err(PsError::RangeCheck("array index out of bounds".to_string()));
+                        }
+                    }
+                    Value::ExecutableArray(a) => {
+                        let idx = key_or_index.as_i64()? as usize;
+                        let mut arr = a.borrow_mut();
+                        if idx < arr.len() {
+                            arr[idx] = val;
                         } else {
                             return Err(PsError::RangeCheck("array index out of bounds".to_string()));
                         }
@@ -716,7 +731,7 @@ impl Interpreter {
                 let val = self.pop_value()?;
                 let len = match val {
                     Value::Array(a) => a.borrow().len(),
-                    Value::ExecutableArray(a) => a.len(),
+                    Value::ExecutableArray(a) => a.borrow().len(),
                     Value::Dict(d) => d.borrow().len(),
                     Value::String(s) => s.len(),
                     _ => return Err(PsError::TypeCheck { expected: "array, dict or string", got: val.type_name().to_string() }),
@@ -1044,7 +1059,7 @@ impl Interpreter {
                 let val = self.pop_value()?;
                 let exe = match val {
                     Value::LiteralName(n) => Value::Name(n),
-                    Value::Array(a) => Value::ExecutableArray(Rc::new(a.borrow().clone())),
+                    Value::Array(a) => Value::new_proc(a.borrow().clone()),
                     other => other,
                 };
                 self.operand_stack.push(exe);
@@ -1053,7 +1068,7 @@ impl Interpreter {
                 let val = self.pop_value()?;
                 let lit = match val {
                     Value::Name(n) => Value::LiteralName(n),
-                    Value::ExecutableArray(a) => Value::new_array((*a).clone()),
+                    Value::ExecutableArray(a) => Value::new_array(a.borrow().clone()),
                     other => other,
                 };
                 self.operand_stack.push(lit);
@@ -1152,7 +1167,7 @@ impl Interpreter {
                         }
                     }
                     Value::ExecutableArray(arr) => {
-                        let items = (*arr).clone();
+                        let items = arr.borrow().clone();
                         for item in items {
                             self.operand_stack.push(item);
                             match self.execute_proc_value(proc.clone(), lexer) {
@@ -1669,6 +1684,13 @@ impl Interpreter {
                 self.font_directory.insert(name.clone(), base_font.clone());
                 self.font_instances.push(base_font.clone());
                 let font_id = self.font_instances.len() - 1;
+                if let Some(type3_dict) = &base_font.type3_dict {
+                    type3_dict
+                        .borrow_mut()
+                        .insert("_FontId".to_string(), Value::Integer(font_id as i64));
+                    self.operand_stack.push(Value::Dict(type3_dict.clone()));
+                    return Ok(true);
+                }
                 let dict = Rc::new(RefCell::new(HashMap::new()));
                 dict.borrow_mut().insert("FontName".to_string(), Value::LiteralName(name.clone()));
                 dict.borrow_mut().insert("FontType".to_string(), Value::Integer(1));
@@ -1777,6 +1799,23 @@ impl Interpreter {
                 });
                 face.name = key.clone();
 
+                let is_type3 = font_dict
+                    .borrow()
+                    .get("FontType")
+                    .and_then(|value| value.as_i64().ok())
+                    == Some(3);
+                if is_type3 {
+                    face.type3_dict = Some(font_dict.clone());
+                    if let Some(matrix) = font_dict
+                        .borrow()
+                        .get("FontMatrix")
+                        .cloned()
+                        .and_then(|value| self.val_to_matrix(value).ok())
+                    {
+                        face.matrix = matrix;
+                    }
+                }
+
                 if let Some(enc_val) = font_dict.borrow().get("Encoding") {
                     if let Value::Array(arr) = enc_val {
                         let strings: Vec<String> = arr.borrow().iter().map(|v| v.as_str_lossy()).collect();
@@ -1807,28 +1846,18 @@ impl Interpreter {
                 let _wx = self.pop_num().ok();
             }
             "imagemask" => {
-                let proc = self.pop_value()?;
-                let _mat = self.pop_value()?;
-                let _polarity = self.pop_value()?;
+                let source = self.pop_value()?;
+                let matrix = self.pop_value()?;
+                let polarity = self.pop_bool()?;
                 let h = self.pop_num().unwrap_or(1.0) as usize;
                 let w = self.pop_num().unwrap_or(1.0) as usize;
                 let total_needed = (w * h + 7) / 8;
-                let mut bytes_read = 0;
-                while bytes_read < total_needed {
-                    self.execute_proc_value(proc.clone(), lexer)?;
-                    if let Ok(val) = self.pop_value() {
-                        match val {
-                            Value::String(s) => {
-                                if s.is_empty() {
-                                    break;
-                                }
-                                bytes_read += s.len();
-                            }
-                            _ => break,
-                        }
-                    } else {
-                        break;
-                    }
+                let data = self.read_image_source(source, total_needed, lexer)?;
+                if w > 0 && h > 0 && !data.is_empty() {
+                    let image_matrix = self
+                        .val_to_matrix(matrix)
+                        .unwrap_or_else(|_| Matrix2D::scale(w as f64, h as f64));
+                    self.push_image_mask(w, h, &data, polarity, image_matrix);
                 }
             }
             "charpath" => {
@@ -1872,14 +1901,19 @@ impl Interpreter {
                 };
 
                 let (mut cx, cy) = self.get_current_point_user().unwrap_or((0.0, 0.0));
+                let font = self.current_gstate.font.clone();
                 for &b in &bytes {
-                    let glyph_name = if let Some(f) = &self.current_gstate.font {
+                    let glyph_name = if let Some(f) = &font {
                         f.encoding.get(b as usize).cloned().unwrap_or_else(|| ".notdef".to_string())
                     } else {
                         (b as char).to_string()
                     };
 
-                    if let Some(f) = &self.current_gstate.font {
+                    if let Some(f) = &font {
+                        if f.type3_dict.is_some() {
+                            cx += self.render_type3_glyph(f, &glyph_name, cx, cy);
+                            continue;
+                        }
                         if let Some((glyph_path, width)) = f.get_glyph_path(&glyph_name) {
                             let placed = glyph_path.transform(&Matrix2D::translate(cx, cy));
                             let transformed = placed.transform(&self.current_gstate.ctm);
@@ -1983,9 +2017,9 @@ impl Interpreter {
     fn execute_proc_value(&mut self, val: Value, lexer: &mut Lexer) -> PsResult<()> {
         match val {
             Value::ExecutableArray(proc) => {
-                let items = proc.clone();
-                for item in items.iter() {
-                    self.eval_value(item.clone(), lexer)?;
+                let items = proc.borrow().clone();
+                for item in items {
+                    self.eval_value(item, lexer)?;
                 }
             }
             Value::Name(n) => self.execute_name(&n, lexer)?,
@@ -2068,7 +2102,7 @@ impl Interpreter {
                 let src_val = self.pop_value()?;
                 let src_items = match src_val {
                     Value::Array(src_a) => src_a.borrow().clone(),
-                    Value::ExecutableArray(src_a) => (*src_a).clone(),
+                    Value::ExecutableArray(src_a) => src_a.borrow().clone(),
                     _ => return Err(PsError::TypeCheck { expected: "array", got: src_val.type_name().to_string() }),
                 };
                 let mut dest = dest_arr.borrow_mut();
@@ -2224,6 +2258,117 @@ impl Interpreter {
     fn set_current_point_user(&mut self, ux: f64, uy: f64) {
         let (dx, dy) = self.current_gstate.ctm.transform_point(ux, uy);
         self.current_gstate.current_point = Some((dx, dy));
+    }
+
+    fn read_image_source(
+        &mut self,
+        source: Value,
+        total_needed: usize,
+        lexer: &mut Lexer,
+    ) -> PsResult<Vec<u8>> {
+        match source {
+            Value::String(bytes) => Ok(bytes),
+            proc => {
+                let mut data = Vec::with_capacity(total_needed);
+                while data.len() < total_needed {
+                    self.execute_proc_value(proc.clone(), lexer)?;
+                    let Value::String(bytes) = self.pop_value()? else {
+                        break;
+                    };
+                    if bytes.is_empty() {
+                        break;
+                    }
+                    data.extend(bytes);
+                }
+                Ok(data)
+            }
+        }
+    }
+
+    fn push_image_mask(
+        &mut self,
+        width: usize,
+        height: usize,
+        data: &[u8],
+        polarity: bool,
+        image_matrix: Matrix2D,
+    ) {
+        let row_bytes = width.div_ceil(8);
+        let mut rgba = vec![0; width * height * 4];
+        let color = self.current_gstate.color;
+
+        for y in 0..height {
+            for x in 0..width {
+                let byte = data.get(y * row_bytes + x / 8).copied().unwrap_or(0);
+                let bit_set = (byte & (0x80 >> (x % 8))) != 0;
+                if bit_set == polarity {
+                    let pixel = (y * width + x) * 4;
+                    rgba[pixel] = (color.r * 255.0).clamp(0.0, 255.0) as u8;
+                    rgba[pixel + 1] = (color.g * 255.0).clamp(0.0, 255.0) as u8;
+                    rgba[pixel + 2] = (color.b * 255.0).clamp(0.0, 255.0) as u8;
+                    rgba[pixel + 3] = (color.a * 255.0).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+
+        let transform = image_matrix
+            .inverse()
+            .unwrap_or_else(|| Matrix2D::scale(1.0 / width as f64, 1.0 / height as f64))
+            .concat(&self.current_gstate.ctm);
+        self.render_target.push_image(
+            width as u32,
+            height as u32,
+            rgba,
+            transform,
+            self.current_gstate.clip_paths.clone(),
+        );
+    }
+
+    fn render_type3_glyph(
+        &mut self,
+        font: &FontFace,
+        glyph_name: &str,
+        current_x: f64,
+        current_y: f64,
+    ) -> f64 {
+        let Some(font_dict) = &font.type3_dict else {
+            return 0.0;
+        };
+        let record = {
+            let dict = font_dict.borrow();
+            let Some(Value::Dict(char_data)) = dict.get("CD") else {
+                return 0.0;
+            };
+            char_data.borrow().get(glyph_name).cloned()
+        };
+        let Some(Value::Array(record)) = record else {
+            return 0.0;
+        };
+        let record = record.borrow();
+        let advance = record
+            .first()
+            .and_then(|value| value.as_f64().ok())
+            .unwrap_or(0.0);
+
+        if record.len() >= 10 {
+            let width = record[5].as_i64().unwrap_or(0).max(0) as usize;
+            let height = record[6].as_i64().unwrap_or(0).max(0) as usize;
+            let tx = record[7].as_f64().unwrap_or(0.0);
+            let ty = record[8].as_f64().unwrap_or(0.0);
+            if let Value::String(data) = &record[9] {
+                let saved_ctm = self.current_gstate.ctm;
+                self.current_gstate.ctm = Matrix2D::new(1.0, 0.0, 0.0, -1.0, tx, ty)
+                    .inverse()
+                    .unwrap_or_default()
+                    .concat(&font.matrix)
+                    .concat(&Matrix2D::translate(current_x, current_y))
+                    .concat(&saved_ctm);
+                self.push_image_mask(width, height, data, true, Matrix2D::identity());
+                self.current_gstate.ctm = saved_ctm;
+            }
+        }
+
+        font.matrix.transform_vector(advance, 0.0).0
     }
 
     fn matrix_to_val(&self, m: Matrix2D) -> Value {

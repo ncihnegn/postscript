@@ -2,9 +2,12 @@ pub mod charstring;
 pub mod eexec;
 pub mod type1;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use crate::matrix::Matrix2D;
 use crate::path::Path;
+use crate::value::Value;
 pub use charstring::{CharStringInterpreter, GlyphOutline};
 pub use type1::Type1Parser;
 
@@ -15,6 +18,7 @@ pub struct FontFace {
     pub encoding: Vec<String>,
     pub charstrings: HashMap<String, GlyphOutline>,
     pub subrs: Vec<Vec<u8>>,
+    pub type3_dict: Option<Rc<RefCell<HashMap<String, Value>>>>,
 }
 
 impl FontFace {
@@ -32,18 +36,19 @@ impl FontFace {
             encoding,
             charstrings: HashMap::new(),
             subrs: Vec::new(),
+            type3_dict: None,
         }
     }
 
     pub fn scalefont(&self, scale: f64) -> Self {
         let mut f = self.clone();
-        f.matrix = Matrix2D::scale(scale * 0.001, scale * 0.001);
+        f.matrix = Matrix2D::scale(scale, scale).concat(&self.matrix);
         f
     }
 
     pub fn makefont(&self, matrix: Matrix2D) -> Self {
         let mut f = self.clone();
-        f.matrix = matrix.concat(&Matrix2D::scale(0.001, 0.001));
+        f.matrix = matrix.concat(&self.matrix);
         f
     }
 
@@ -105,6 +110,7 @@ pub fn load_font_by_name(name: &str) -> Option<FontFace> {
             encoding,
             charstrings,
             subrs,
+            type3_dict: None,
         })
     } else {
         None
