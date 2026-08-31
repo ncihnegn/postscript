@@ -1,6 +1,6 @@
 use postscript::{
     execute_page_with_embedded_recovery, Color, DrawCommand, DscDocument, Interpreter, Matrix2D,
-    Value,
+    PathSegment, Value,
 };
 
 #[test]
@@ -87,6 +87,35 @@ fn test_matrix_transforms() {
     let (x, y) = m.transform_point(5.0, 5.0);
     assert_eq!(x, 30.0);
     assert_eq!(y, 75.0);
+}
+
+#[test]
+fn test_path_coordinates_are_fixed_when_ctm_changes_before_painting() {
+    let mut interp = Interpreter::new(200, 200);
+    interp
+        .execute_str(
+            "
+            newpath
+            10 10 moveto
+            100 10 lineto
+            [1 0 0 1 25 30] concat
+            stroke
+        ",
+        )
+        .unwrap();
+
+    match &interp.render_target.commands[0] {
+        DrawCommand::Stroke { path, .. } => {
+            assert_eq!(
+                path.segments,
+                vec![
+                    PathSegment::MoveTo(10.0, 190.0),
+                    PathSegment::LineTo(100.0, 190.0),
+                ]
+            );
+        }
+        _ => panic!("expected a stroke command"),
+    }
 }
 
 #[test]

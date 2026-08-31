@@ -4,6 +4,7 @@ use crate::font::eexec::Type1Cipher;
 use crate::gstate::{Color, GraphicsState, LineCap, LineJoin};
 use crate::lexer::{Lexer, Token};
 use crate::matrix::Matrix2D;
+use crate::path::{Path, PathSegment};
 use crate::render::RenderTarget;
 use crate::value::Value;
 use std::cell::RefCell;
@@ -1248,12 +1249,15 @@ impl Interpreter {
             "newpath" => {
                 self.current_gstate.current_path.clear();
                 self.current_gstate.current_point = None;
+                self.current_gstate.subpath_start = None;
             }
             "moveto" => {
                 let y = self.pop_num()?;
                 let x = self.pop_num()?;
-                self.current_gstate.current_path.move_to(x, y);
-                self.set_current_point_user(x, y);
+                let point = self.current_gstate.ctm.transform_point(x, y);
+                self.current_gstate.current_path.move_to(point.0, point.1);
+                self.current_gstate.current_point = Some(point);
+                self.current_gstate.subpath_start = Some(point);
             }
             "rmoveto" => {
                 let dy = self.pop_num()?;
@@ -1261,14 +1265,17 @@ impl Interpreter {
                 let (cx, cy) = self.get_current_point_user().unwrap_or((0.0, 0.0));
                 let nx = cx + dx;
                 let ny = cy + dy;
-                self.current_gstate.current_path.move_to(nx, ny);
-                self.set_current_point_user(nx, ny);
+                let point = self.current_gstate.ctm.transform_point(nx, ny);
+                self.current_gstate.current_path.move_to(point.0, point.1);
+                self.current_gstate.current_point = Some(point);
+                self.current_gstate.subpath_start = Some(point);
             }
             "lineto" => {
                 let y = self.pop_num()?;
                 let x = self.pop_num()?;
-                self.current_gstate.current_path.line_to(x, y);
-                self.set_current_point_user(x, y);
+                let point = self.current_gstate.ctm.transform_point(x, y);
+                self.current_gstate.current_path.line_to(point.0, point.1);
+                self.current_gstate.current_point = Some(point);
             }
             "rlineto" => {
                 let dy = self.pop_num()?;
@@ -1276,8 +1283,9 @@ impl Interpreter {
                 let (cx, cy) = self.get_current_point_user().unwrap_or((0.0, 0.0));
                 let nx = cx + dx;
                 let ny = cy + dy;
-                self.current_gstate.current_path.line_to(nx, ny);
-                self.set_current_point_user(nx, ny);
+                let point = self.current_gstate.ctm.transform_point(nx, ny);
+                self.current_gstate.current_path.line_to(point.0, point.1);
+                self.current_gstate.current_point = Some(point);
             }
             "curveto" => {
                 let y3 = self.pop_num()?;
@@ -1286,8 +1294,13 @@ impl Interpreter {
                 let x2 = self.pop_num()?;
                 let y1 = self.pop_num()?;
                 let x1 = self.pop_num()?;
-                self.current_gstate.current_path.curve_to(x1, y1, x2, y2, x3, y3);
-                self.set_current_point_user(x3, y3);
+                let p1 = self.current_gstate.ctm.transform_point(x1, y1);
+                let p2 = self.current_gstate.ctm.transform_point(x2, y2);
+                let p3 = self.current_gstate.ctm.transform_point(x3, y3);
+                self.current_gstate.current_path.curve_to(
+                    p1.0, p1.1, p2.0, p2.1, p3.0, p3.1,
+                );
+                self.current_gstate.current_point = Some(p3);
             }
             "rcurveto" => {
                 let dy3 = self.pop_num()?;
@@ -1303,8 +1316,13 @@ impl Interpreter {
                 let ny2 = ny1 + dy2;
                 let nx3 = nx2 + dx3;
                 let ny3 = ny2 + dy3;
-                self.current_gstate.current_path.curve_to(nx1, ny1, nx2, ny2, nx3, ny3);
-                self.set_current_point_user(nx3, ny3);
+                let p1 = self.current_gstate.ctm.transform_point(nx1, ny1);
+                let p2 = self.current_gstate.ctm.transform_point(nx2, ny2);
+                let p3 = self.current_gstate.ctm.transform_point(nx3, ny3);
+                self.current_gstate.current_path.curve_to(
+                    p1.0, p1.1, p2.0, p2.1, p3.0, p3.1,
+                );
+                self.current_gstate.current_point = Some(p3);
             }
             "arc" => {
                 let angle2 = self.pop_num()?;
@@ -1312,10 +1330,24 @@ impl Interpreter {
                 let r = self.pop_num()?;
                 let y = self.pop_num()?;
                 let x = self.pop_num()?;
-                self.current_gstate.current_path.arc(x, y, r, angle1, angle2, false);
+                let was_empty = self.current_gstate.current_path.is_empty();
+                let mut arc = Path::new();
+                arc.arc(x, y, r, angle1, angle2, false);
+                let mut transformed = arc.transform(&self.current_gstate.ctm);
+                if !was_empty {
+                    if let Some(PathSegment::MoveTo(x, y)) = transformed.segments.first().cloned() {
+                        transformed.segments[0] = PathSegment::LineTo(x, y);
+                    }
+                }
+                self.current_gstate.current_path.append(&transformed);
                 let end_x = x + r * angle2.to_radians().cos();
                 let end_y = y + r * angle2.to_radians().sin();
                 self.set_current_point_user(end_x, end_y);
+                if was_empty {
+                    if let Some(PathSegment::MoveTo(x, y)) = transformed.segments.first().cloned() {
+                        self.current_gstate.subpath_start = Some((x, y));
+                    }
+                }
             }
             "arcn" => {
                 let angle2 = self.pop_num()?;
@@ -1323,13 +1355,28 @@ impl Interpreter {
                 let r = self.pop_num()?;
                 let y = self.pop_num()?;
                 let x = self.pop_num()?;
-                self.current_gstate.current_path.arc(x, y, r, angle1, angle2, true);
+                let was_empty = self.current_gstate.current_path.is_empty();
+                let mut arc = Path::new();
+                arc.arc(x, y, r, angle1, angle2, true);
+                let mut transformed = arc.transform(&self.current_gstate.ctm);
+                if !was_empty {
+                    if let Some(PathSegment::MoveTo(x, y)) = transformed.segments.first().cloned() {
+                        transformed.segments[0] = PathSegment::LineTo(x, y);
+                    }
+                }
+                self.current_gstate.current_path.append(&transformed);
                 let end_x = x + r * angle2.to_radians().cos();
                 let end_y = y + r * angle2.to_radians().sin();
                 self.set_current_point_user(end_x, end_y);
+                if was_empty {
+                    if let Some(PathSegment::MoveTo(x, y)) = transformed.segments.first().cloned() {
+                        self.current_gstate.subpath_start = Some((x, y));
+                    }
+                }
             }
             "closepath" => {
                 self.current_gstate.current_path.close_path();
+                self.current_gstate.current_point = self.current_gstate.subpath_start;
             }
             "currentpoint" => {
                 if let Some((x, y)) = self.get_current_point_user() {
@@ -1342,42 +1389,42 @@ impl Interpreter {
 
             // Painting
             "fill" => {
-                let transformed_path = self.current_gstate.current_path.transform(&self.current_gstate.ctm);
                 self.render_target.push_fill(
-                    transformed_path,
+                    self.current_gstate.current_path.clone(),
                     self.current_gstate.color,
                     false,
                     self.current_gstate.clip_paths.clone(),
                 );
                 self.current_gstate.current_path.clear();
                 self.current_gstate.current_point = None;
+                self.current_gstate.subpath_start = None;
             }
             "eofill" => {
-                let transformed_path = self.current_gstate.current_path.transform(&self.current_gstate.ctm);
                 self.render_target.push_fill(
-                    transformed_path,
+                    self.current_gstate.current_path.clone(),
                     self.current_gstate.color,
                     true,
                     self.current_gstate.clip_paths.clone(),
                 );
                 self.current_gstate.current_path.clear();
                 self.current_gstate.current_point = None;
+                self.current_gstate.subpath_start = None;
             }
             "clip" | "eoclip" => {
                 if !self.current_gstate.current_path.is_empty() {
                     self.current_gstate.clip_paths.push(crate::gstate::ClipPath {
-                        path: self.current_gstate.current_path.transform(&self.current_gstate.ctm),
+                        path: self.current_gstate.current_path.clone(),
                         even_odd: name == "eoclip",
                     });
                 }
                 self.current_gstate.current_path.clear();
                 self.current_gstate.current_point = None;
+                self.current_gstate.subpath_start = None;
             }
             "stroke" => {
-                let transformed_path = self.current_gstate.current_path.transform(&self.current_gstate.ctm);
                 let (scaled_width, _) = self.current_gstate.ctm.transform_vector(self.current_gstate.line_width, 0.0);
                 self.render_target.push_stroke(
-                    transformed_path,
+                    self.current_gstate.current_path.clone(),
                     self.current_gstate.color,
                     scaled_width.abs(),
                     self.current_gstate.line_cap,
@@ -1387,6 +1434,7 @@ impl Interpreter {
                 );
                 self.current_gstate.current_path.clear();
                 self.current_gstate.current_point = None;
+                self.current_gstate.subpath_start = None;
             }
             "showpage" => {
                 let w = self.render_target.width;
@@ -1398,6 +1446,7 @@ impl Interpreter {
                 self.pages_rendered.push(page);
                 self.current_gstate.current_path.clear();
                 self.current_gstate.current_point = None;
+                self.current_gstate.subpath_start = None;
             }
 
             // Style & Color
@@ -1802,7 +1851,8 @@ impl Interpreter {
                     if let Some(f) = &self.current_gstate.font {
                         if let Some((glyph_path, width)) = f.get_glyph_path(&glyph_name) {
                             let placed = glyph_path.transform(&Matrix2D::translate(cx, cy));
-                            self.current_gstate.current_path.append(&placed);
+                            let transformed = placed.transform(&self.current_gstate.ctm);
+                            self.current_gstate.current_path.append(&transformed);
                             cx += width;
                             continue;
                         }
