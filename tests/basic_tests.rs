@@ -130,6 +130,52 @@ fn test_matrix_transforms() {
 }
 
 #[test]
+fn test_matrix_transform_operators_return_transformed_matrix() {
+    let mut interp = Interpreter::new(100, 100);
+    interp.execute_str("3 4 matrix translate").unwrap();
+    let Value::Array(matrix) = interp.operand_stack.pop().unwrap() else {
+        panic!("expected a matrix");
+    };
+    let matrix = matrix.borrow();
+    assert_eq!(matrix[4], Value::Real(3.0));
+    assert_eq!(matrix[5], Value::Real(4.0));
+
+    interp.execute_str("2 3 matrix scale").unwrap();
+    let Value::Array(matrix) = interp.operand_stack.pop().unwrap() else {
+        panic!("expected a matrix");
+    };
+    let matrix = matrix.borrow();
+    assert_eq!(matrix[0], Value::Real(2.0));
+    assert_eq!(matrix[3], Value::Real(3.0));
+
+    interp.execute_str("90 matrix rotate").unwrap();
+    let Value::Array(matrix) = interp.operand_stack.pop().unwrap() else {
+        panic!("expected a matrix");
+    };
+    let matrix = matrix.borrow();
+    assert!(matrix[0].as_f64().unwrap().abs() < 1e-12);
+    assert_eq!(matrix[1], Value::Real(1.0));
+    assert_eq!(matrix[2], Value::Real(-1.0));
+    assert!(matrix[3].as_f64().unwrap().abs() < 1e-12);
+}
+
+#[test]
+fn test_pattern_stub_preserves_pattern_and_rectfill_paints() {
+    let mut interp = Interpreter::new(100, 100);
+    interp
+        .execute_str(
+            "<< /PatternType 1 /BGnd [0.2 0.3 0.4 false] >> matrix makepattern \
+             setpattern 10 10 20 20 rectfill",
+        )
+        .unwrap();
+
+    let Some(DrawCommand::Fill { color, .. }) = interp.render_target.commands.last() else {
+        panic!("expected a fill command");
+    };
+    assert_eq!(*color, Color::rgb(0.2, 0.3, 0.4));
+}
+
+#[test]
 fn test_path_coordinates_are_fixed_when_ctm_changes_before_painting() {
     let mut interp = Interpreter::new(200, 200);
     interp

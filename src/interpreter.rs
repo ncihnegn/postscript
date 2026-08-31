@@ -883,6 +883,44 @@ impl Interpreter {
             "setcolorspace" => {
                 self.pop_value().ok();
             }
+            "makepattern" => {
+                let _matrix = self.pop_value()?;
+                let pattern = self.pop_value()?;
+                self.operand_stack.push(pattern);
+            }
+            "setpattern" => {
+                let pattern = self.pop_value()?;
+                if let Value::Dict(pattern) = pattern {
+                    let color = {
+                        let pattern = pattern.borrow();
+                        pattern
+                            .get("BGnd")
+                            .or_else(|| pattern.get("FGnd"))
+                            .and_then(|components| match components {
+                                Value::Array(values) => {
+                                    let values = values.borrow();
+                                    match values.as_slice() {
+                                        [gray, Value::Bool(true)] => {
+                                            gray.as_f64().ok().map(Color::gray)
+                                        }
+                                        [red, green, blue, Value::Bool(false)] => {
+                                            Some(Color::rgb(
+                                                red.as_f64().ok()?,
+                                                green.as_f64().ok()?,
+                                                blue.as_f64().ok()?,
+                                            ))
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            })
+                    };
+                    if let Some(color) = color {
+                        self.current_gstate.color = color;
+                    }
+                }
+            }
             "setcolor" => {
                 if let Ok(n1) = self.pop_num() {
                     if let Ok(n2) = self.pop_num() {
@@ -1425,6 +1463,36 @@ impl Interpreter {
                 self.current_gstate.current_point = None;
                 self.current_gstate.subpath_start = None;
             }
+            "rectfill" => {
+                let height = self.pop_num()?;
+                let width = self.pop_num()?;
+                let y = self.pop_num()?;
+                let x = self.pop_num()?;
+                let mut path = Path::new();
+                for (index, (x, y)) in [
+                    (x, y),
+                    (x + width, y),
+                    (x + width, y + height),
+                    (x, y + height),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let (x, y) = self.current_gstate.ctm.transform_point(x, y);
+                    if index == 0 {
+                        path.move_to(x, y);
+                    } else {
+                        path.line_to(x, y);
+                    }
+                }
+                path.close_path();
+                self.render_target.push_fill(
+                    path,
+                    self.current_gstate.color,
+                    false,
+                    self.current_gstate.clip_paths.clone(),
+                );
+            }
             "clip" | "eoclip" => {
                 if !self.current_gstate.current_path.is_empty() {
                     self.current_gstate.clip_paths.push(crate::gstate::ClipPath {
@@ -1560,21 +1628,54 @@ impl Interpreter {
 
             // Coordinate Transforms
             "translate" => {
-                let ty = self.pop_num()?;
-                let tx = self.pop_num()?;
+                let target = self.pop_value()?;
+                let (ty, tx, matrix) = if let Ok(matrix) = self.val_to_matrix(target.clone()) {
+                    let ty = self.pop_num()?;
+                    let tx = self.pop_num()?;
+                    (ty, tx, Some(matrix))
+                } else {
+                    let ty = target.as_f64()?;
+                    let tx = self.pop_num()?;
+                    (ty, tx, None)
+                };
                 let t_mat = Matrix2D::translate(tx, ty);
-                self.current_gstate.ctm = t_mat.concat(&self.current_gstate.ctm);
+                if let Some(matrix) = matrix {
+                    self.operand_stack.push(self.matrix_to_val(t_mat.concat(&matrix)));
+                } else {
+                    self.current_gstate.ctm = t_mat.concat(&self.current_gstate.ctm);
+                }
             }
             "scale" => {
-                let sy = self.pop_num()?;
-                let sx = self.pop_num()?;
+                let target = self.pop_value()?;
+                let (sy, sx, matrix) = if let Ok(matrix) = self.val_to_matrix(target.clone()) {
+                    let sy = self.pop_num()?;
+                    let sx = self.pop_num()?;
+                    (sy, sx, Some(matrix))
+                } else {
+                    let sy = target.as_f64()?;
+                    let sx = self.pop_num()?;
+                    (sy, sx, None)
+                };
                 let s_mat = Matrix2D::scale(sx, sy);
-                self.current_gstate.ctm = s_mat.concat(&self.current_gstate.ctm);
+                if let Some(matrix) = matrix {
+                    self.operand_stack.push(self.matrix_to_val(s_mat.concat(&matrix)));
+                } else {
+                    self.current_gstate.ctm = s_mat.concat(&self.current_gstate.ctm);
+                }
             }
             "rotate" => {
-                let deg = self.pop_num()?;
+                let target = self.pop_value()?;
+                let (deg, matrix) = if let Ok(matrix) = self.val_to_matrix(target.clone()) {
+                    (self.pop_num()?, Some(matrix))
+                } else {
+                    (target.as_f64()?, None)
+                };
                 let r_mat = Matrix2D::rotate(deg);
-                self.current_gstate.ctm = r_mat.concat(&self.current_gstate.ctm);
+                if let Some(matrix) = matrix {
+                    self.operand_stack.push(self.matrix_to_val(r_mat.concat(&matrix)));
+                } else {
+                    self.current_gstate.ctm = r_mat.concat(&self.current_gstate.ctm);
+                }
             }
             "concat" => {
                 let mat_val = self.pop_value()?;
