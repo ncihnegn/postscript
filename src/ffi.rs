@@ -46,13 +46,7 @@ pub unsafe extern "C" fn ps_document_get_page_size(
         return -1;
     }
     let doc = unsafe { &*handle };
-    let (w, h) = if let Some(bbox) = &doc.dsc.bounding_box {
-        (bbox.width(), bbox.height())
-    } else if let Some(bbox) = &doc.dsc.hires_bounding_box {
-        (bbox.width(), bbox.height())
-    } else {
-        (612.0, 792.0) // Standard US Letter default
-    };
+    let (w, h) = doc.dsc.page_size();
 
     unsafe {
         *out_width = if w > 0.0 { w } else { 612.0 };
@@ -73,13 +67,7 @@ pub unsafe extern "C" fn ps_document_render_page_rgba(
         return -1;
     }
     let doc = unsafe { &*handle };
-    let (page_w, page_h) = if let Some(bbox) = &doc.dsc.bounding_box {
-        (bbox.width(), bbox.height())
-    } else if let Some(bbox) = &doc.dsc.hires_bounding_box {
-        (bbox.width(), bbox.height())
-    } else {
-        (612.0, 792.0)
-    };
+    let (page_w, page_h) = doc.dsc.page_size();
 
     let mut interp = Interpreter::with_page_size(page_w, page_h, width, height);
 
@@ -88,9 +76,10 @@ pub unsafe extern "C" fn ps_document_render_page_rgba(
             interp.execute_bytes(&doc.data[start..end]).ok();
         }
         let page = &doc.dsc.pages[page_index];
-        if let Err(_) = interp.execute_bytes(&doc.data[page.start_byte_offset..page.end_byte_offset]) {
-            // Execution warning, proceed with recorded commands
-        }
+        execute_page_with_embedded_recovery(
+            &mut interp,
+            &doc.data[page.start_byte_offset..page.end_byte_offset],
+        );
     } else {
         if let Err(_) = interp.execute_bytes(&doc.data) {
             // Execution warning, proceed with recorded commands
@@ -106,6 +95,52 @@ pub unsafe extern "C" fn ps_document_render_page_rgba(
             0
         }
         Err(_) => -1,
+    }
+}
+
+pub fn execute_page_with_embedded_recovery(interp: &mut Interpreter, page_bytes: &[u8]) {
+    let page_bytes = page_bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .scan(0usize, |offset, line| {
+            *offset += line.len();
+            Some((*offset, line))
+        })
+        .find_map(|(offset, line)| {
+            (line.trim_ascii() == b"showpage").then_some(offset)
+        })
+        .map(|end| &page_bytes[..end])
+        .unwrap_or(page_bytes);
+
+    let mut segment_start = 0;
+    let mut embedded_depth = 0usize;
+    let mut offset = 0;
+
+    for line in page_bytes.split_inclusive(|byte| *byte == b'\n') {
+        let trimmed = line.trim_ascii();
+        let begins_document = trimmed.starts_with(b"%%BeginDocument");
+        let ends_document = trimmed.starts_with(b"%%EndDocument");
+
+        if begins_document {
+            if embedded_depth == 0 {
+                if let Err(e) = interp.execute_bytes(&page_bytes[segment_start..offset]) {
+                    eprintln!("Error executing page segment before %%BeginDocument: {}", e);
+                }
+            }
+            embedded_depth += 1;
+        } else if ends_document && embedded_depth > 0 {
+            embedded_depth -= 1;
+            if embedded_depth == 0 {
+                segment_start = offset + line.len();
+            }
+        }
+
+        offset += line.len();
+    }
+
+    if embedded_depth == 0 && segment_start < page_bytes.len() {
+        if let Err(e) = interp.execute_bytes(&page_bytes[segment_start..]) {
+            eprintln!("Error executing page segment: {}", e);
+        }
     }
 }
 

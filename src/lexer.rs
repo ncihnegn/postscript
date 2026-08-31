@@ -136,8 +136,11 @@ impl<'a> Lexer<'a> {
                     false
                 };
                 let name = self.read_name_string()?;
-                let _ = is_immediate;
-                Ok(Some(Token::Value(Value::LiteralName(name))))
+                if is_immediate {
+                    Ok(Some(Token::Value(Value::ImmediateName(name))))
+                } else {
+                    Ok(Some(Token::Value(Value::LiteralName(name))))
+                }
             }
             _ => {
                 let s = self.read_name_string()?;

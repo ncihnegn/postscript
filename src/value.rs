@@ -4,7 +4,7 @@ use std::fmt;
 use std::rc::Rc;
 use std::cell::RefCell;
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub enum Value {
     Integer(i64),
     Real(f64),
@@ -12,11 +12,34 @@ pub enum Value {
     String(Vec<u8>),
     Name(String),        // executable name: add, moveto, etc.
     LiteralName(String), // literal name: /Foo, /Times-Roman, etc.
+    ImmediateName(String), // immediately resolved name: //Foo
     Array(Rc<RefCell<Vec<Value>>>),
     ExecutableArray(Rc<Vec<Value>>), // { ... } procedure block
     Dict(Rc<RefCell<HashMap<String, Value>>>),
     Mark,
     Null,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Real(a), Value::Real(b)) => a == b,
+            (Value::Integer(a), Value::Real(b)) | (Value::Real(b), Value::Integer(a)) => {
+                (*a as f64) == *b
+            }
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Name(a), Value::Name(b))
+            | (Value::LiteralName(a), Value::LiteralName(b))
+            | (Value::ImmediateName(a), Value::ImmediateName(b)) => a == b,
+            (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
+            (Value::ExecutableArray(a), Value::ExecutableArray(b)) => Rc::ptr_eq(a, b),
+            (Value::Dict(a), Value::Dict(b)) => Rc::ptr_eq(a, b),
+            (Value::Mark, Value::Mark) | (Value::Null, Value::Null) => true,
+            _ => false,
+        }
+    }
 }
 
 impl Value {
@@ -71,7 +94,7 @@ impl Value {
     pub fn as_str_lossy(&self) -> String {
         match self {
             Value::String(s) => String::from_utf8_lossy(s).to_string(),
-            Value::Name(n) | Value::LiteralName(n) => n.clone(),
+            Value::Name(n) | Value::LiteralName(n) | Value::ImmediateName(n) => n.clone(),
             _ => format!("{}", self),
         }
     }
@@ -82,7 +105,7 @@ impl Value {
             Value::Real(_) => "realtype",
             Value::Bool(_) => "booleantype",
             Value::String(_) => "stringtype",
-            Value::Name(_) | Value::LiteralName(_) => "nametype",
+            Value::Name(_) | Value::LiteralName(_) | Value::ImmediateName(_) => "nametype",
             Value::Array(_) => "arraytype",
             Value::ExecutableArray(_) => "arraytype",
             Value::Dict(_) => "dicttype",
@@ -101,6 +124,7 @@ impl fmt::Debug for Value {
             Value::String(s) => write!(f, "({})", String::from_utf8_lossy(s)),
             Value::Name(n) => write!(f, "{}", n),
             Value::LiteralName(n) => write!(f, "/{}", n),
+            Value::ImmediateName(n) => write!(f, "//{}", n),
             Value::Array(a) => write!(f, "{:?}", a.borrow()),
             Value::ExecutableArray(a) => write!(f, "{{{:?}}}", a),
             Value::Dict(d) => write!(f, "<<dict: {} entries>>", d.borrow().len()),
@@ -119,6 +143,7 @@ impl fmt::Display for Value {
             Value::String(s) => write!(f, "{}", String::from_utf8_lossy(s)),
             Value::Name(n) => write!(f, "{}", n),
             Value::LiteralName(n) => write!(f, "/{}", n),
+            Value::ImmediateName(n) => write!(f, "//{}", n),
             Value::Array(a) => write!(f, "[array: {}]", a.borrow().len()),
             Value::ExecutableArray(a) => write!(f, "{{proc: {} ops}}", a.len()),
             Value::Dict(d) => write!(f, "<dict:{}>", d.borrow().len()),

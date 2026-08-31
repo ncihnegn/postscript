@@ -50,6 +50,12 @@ impl Color {
 }
 
 #[derive(Debug, Clone)]
+pub struct ClipPath {
+    pub path: Path,
+    pub even_odd: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct GraphicsState {
     pub ctm: Matrix2D,
     pub current_path: Path,
@@ -62,6 +68,7 @@ pub struct GraphicsState {
     pub dash_offset: f64,
     pub color: Color,
     pub font: Option<FontFace>,
+    pub clip_paths: Vec<ClipPath>,
 }
 
 impl Default for GraphicsState {
@@ -78,6 +85,7 @@ impl Default for GraphicsState {
             dash_offset: 0.0,
             color: Color::BLACK,
             font: None,
+            clip_paths: Vec::new(),
         }
     }
 }

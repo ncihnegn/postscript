@@ -1,4 +1,4 @@
-use postscript::{DscDocument, Interpreter, Color};
+use postscript::{execute_page_with_embedded_recovery, DscDocument, Interpreter, Color};
 use std::env;
 use std::fs;
 use std::process;
@@ -71,13 +71,7 @@ fn main() {
     println!("DSC Info:");
     println!("  Title: {:?}", dsc.title);
     println!("  Creator: {:?}", dsc.creator);
-    let (page_w, page_h) = if let Some(bbox) = &dsc.bounding_box {
-        (bbox.width(), bbox.height())
-    } else if let Some(bbox) = &dsc.hires_bounding_box {
-        (bbox.width(), bbox.height())
-    } else {
-        (612.0, 792.0)
-    };
+    let (page_w, page_h) = dsc.page_size();
 
     let mut interp = Interpreter::with_page_size(page_w, page_h, width, height);
     let page_index = page_num.saturating_sub(1);
@@ -90,9 +84,10 @@ fn main() {
             }
         }
         let page = &dsc.pages[page_index];
-        if let Err(e) = interp.execute_bytes(&bytes[page.start_byte_offset..page.end_byte_offset]) {
-            eprintln!("Warning during page execution: {}", e);
-        }
+        execute_page_with_embedded_recovery(
+            &mut interp,
+            &bytes[page.start_byte_offset..page.end_byte_offset],
+        );
     } else {
         println!("Executing full PostScript stream...");
         if let Err(e) = interp.execute_bytes(&bytes) {

@@ -1,9 +1,9 @@
 use crate::error::{PsError, PsResult};
-use crate::gstate::{Color, LineCap, LineJoin};
+use crate::gstate::{ClipPath, Color, LineCap, LineJoin};
 use crate::path::{Path, PathSegment};
 use tiny_skia::{
     Color as SkColor, FillRule, LineCap as SkLineCap, LineJoin as SkLineJoin,
-    Paint, PathBuilder, Pixmap, Stroke, Transform,
+    Mask, Paint, PathBuilder, Pixmap, Stroke, Transform,
 };
 
 #[derive(Debug, Clone)]
@@ -12,6 +12,7 @@ pub enum DrawCommand {
         path: Path,
         color: Color,
         even_odd: bool,
+        clip_paths: Vec<ClipPath>,
     },
     Stroke {
         path: Path,
@@ -20,12 +21,14 @@ pub enum DrawCommand {
         cap: LineCap,
         join: LineJoin,
         miter_limit: f64,
+        clip_paths: Vec<ClipPath>,
     },
     Image {
         width: u32,
         height: u32,
         rgba_data: Vec<u8>,
         transform: crate::matrix::Matrix2D,
+        clip_paths: Vec<ClipPath>,
     },
 }
 
@@ -45,12 +48,13 @@ impl RenderTarget {
         }
     }
 
-    pub fn push_fill(&mut self, path: Path, color: Color, even_odd: bool) {
+    pub fn push_fill(&mut self, path: Path, color: Color, even_odd: bool, clip_paths: Vec<ClipPath>) {
         if !path.is_empty() {
             self.commands.push(DrawCommand::Fill {
                 path,
                 color,
                 even_odd,
+                clip_paths,
             });
         }
     }
@@ -63,6 +67,7 @@ impl RenderTarget {
         cap: LineCap,
         join: LineJoin,
         miter_limit: f64,
+        clip_paths: Vec<ClipPath>,
     ) {
         if !path.is_empty() {
             self.commands.push(DrawCommand::Stroke {
@@ -72,17 +77,26 @@ impl RenderTarget {
                 cap,
                 join,
                 miter_limit,
+                clip_paths,
             });
         }
     }
 
-    pub fn push_image(&mut self, width: u32, height: u32, rgba_data: Vec<u8>, transform: crate::matrix::Matrix2D) {
+    pub fn push_image(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba_data: Vec<u8>,
+        transform: crate::matrix::Matrix2D,
+        clip_paths: Vec<ClipPath>,
+    ) {
         if width > 0 && height > 0 && !rgba_data.is_empty() {
             self.commands.push(DrawCommand::Image {
                 width,
                 height,
                 rgba_data,
                 transform,
+                clip_paths,
             });
         }
     }
@@ -100,7 +114,7 @@ impl RenderTarget {
 
         for cmd in &self.commands {
             match cmd {
-                DrawCommand::Image { width, height, rgba_data, transform } => {
+                DrawCommand::Image { width, height, rgba_data, transform, clip_paths } => {
                     if let Some(size) = tiny_skia::IntSize::from_wh(*width, *height) {
                         if let Some(img_pixmap) = tiny_skia::PixmapRef::from_bytes(rgba_data, size.width(), size.height()) {
                             let sk_transform = Transform::from_row(
@@ -111,17 +125,18 @@ impl RenderTarget {
                                 transform.tx as f32,
                                 transform.ty as f32,
                             );
+                            let mask = self.clip_mask(clip_paths);
                             pixmap.draw_pixmap(
                                 0, 0,
                                 img_pixmap,
                                 &tiny_skia::PixmapPaint::default(),
                                 sk_transform,
-                                None,
+                                mask.as_ref(),
                             );
                         }
                     }
                 }
-                DrawCommand::Fill { path, color, even_odd } => {
+                DrawCommand::Fill { path, color, even_odd, clip_paths } => {
                     if let Some(sk_path) = self.build_skia_path(path) {
                         let mut paint = Paint::default();
                         paint.set_color_rgba8(
@@ -138,12 +153,13 @@ impl RenderTarget {
                             FillRule::Winding
                         };
 
+                        let mask = self.clip_mask(clip_paths);
                         pixmap.fill_path(
                             &sk_path,
                             &paint,
                             fill_rule,
                             Transform::identity(),
-                            None,
+                            mask.as_ref(),
                         );
                     }
                 }
@@ -154,6 +170,7 @@ impl RenderTarget {
                     cap,
                     join,
                     miter_limit,
+                    clip_paths,
                 } => {
                     if let Some(sk_path) = self.build_skia_path(path) {
                         let mut paint = Paint::default();
@@ -185,12 +202,13 @@ impl RenderTarget {
                             ..Default::default()
                         };
 
+                        let mask = self.clip_mask(clip_paths);
                         pixmap.stroke_path(
                             &sk_path,
                             &paint,
                             &stroke,
                             Transform::identity(),
-                            None,
+                            mask.as_ref(),
                         );
                     }
                 }
@@ -239,5 +257,38 @@ impl RenderTarget {
         }
 
         builder.finish()
+    }
+
+    fn clip_mask(&self, clip_paths: &[ClipPath]) -> Option<Mask> {
+        if clip_paths.is_empty() {
+            return None;
+        }
+        let mut mask = Mask::new(self.width, self.height)?;
+
+        for (index, clip) in clip_paths.iter().enumerate() {
+            let fill_rule = if clip.even_odd {
+                FillRule::EvenOdd
+            } else {
+                FillRule::Winding
+            };
+
+            if index == 0 {
+                mask.fill_path(
+                    &self.build_skia_path(&clip.path)?,
+                    fill_rule,
+                    true,
+                    Transform::identity(),
+                );
+            } else {
+                mask.intersect_path(
+                    &self.build_skia_path(&clip.path)?,
+                    fill_rule,
+                    true,
+                    Transform::identity(),
+                );
+            }
+        }
+
+        Some(mask)
     }
 }

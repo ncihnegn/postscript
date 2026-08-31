@@ -12,6 +12,7 @@ pub mod value;
 
 pub use dsc::{BoundingBox, DscDocument, DscPage};
 pub use error::{PsError, PsResult};
+pub use ffi::execute_page_with_embedded_recovery;
 pub use font::{FontFace, GlyphOutline};
 pub use gstate::{Color, GraphicsState, LineCap, LineJoin};
 pub use interpreter::Interpreter;
@@ -24,13 +25,7 @@ pub use value::Value;
 /// Renders a specific page or the whole PostScript stream to a `tiny_skia::Pixmap`.
 pub fn render_ps_to_pixmap(ps_bytes: &[u8], page_index: usize, width: u32, height: u32) -> PsResult<tiny_skia::Pixmap> {
     let dsc = DscDocument::parse(ps_bytes);
-    let (page_w, page_h) = if let Some(bbox) = &dsc.bounding_box {
-        (bbox.width(), bbox.height())
-    } else if let Some(bbox) = &dsc.hires_bounding_box {
-        (bbox.width(), bbox.height())
-    } else {
-        (612.0, 792.0)
-    };
+    let (page_w, page_h) = dsc.page_size();
     let mut interp = Interpreter::with_page_size(page_w, page_h, width, height);
 
     if !dsc.pages.is_empty() && page_index < dsc.pages.len() {
@@ -41,7 +36,10 @@ pub fn render_ps_to_pixmap(ps_bytes: &[u8], page_index: usize, width: u32, heigh
 
         // Execute specific page
         let page = &dsc.pages[page_index];
-        interp.execute_bytes(&ps_bytes[page.start_byte_offset..page.end_byte_offset])?;
+        execute_page_with_embedded_recovery(
+            &mut interp,
+            &ps_bytes[page.start_byte_offset..page.end_byte_offset],
+        );
 
         if !interp.pages_rendered.is_empty() {
             return interp.pages_rendered.last().unwrap().render_to_pixmap(Color::WHITE);

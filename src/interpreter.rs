@@ -79,6 +79,35 @@ impl Interpreter {
         systemdict.borrow_mut().insert("statusdict".to_string(), Value::Dict(statusdict.clone()));
         systemdict.borrow_mut().insert("globaldict".to_string(), Value::Dict(globaldict.clone()));
         systemdict.borrow_mut().insert("FontDirectory".to_string(), Value::Dict(fontdir.clone()));
+        systemdict.borrow_mut().insert("product".to_string(), Value::String(b"macDVI PostScript".to_vec()));
+        systemdict.borrow_mut().insert("version".to_string(), Value::String(b"3010".to_vec()));
+        systemdict.borrow_mut().insert("revision".to_string(), Value::Integer(1));
+        systemdict.borrow_mut().insert("languagelevel".to_string(), Value::Integer(2));
+        for type_name in [
+            "arraytype",
+            "booleantype",
+            "dicttype",
+            "filetype",
+            "fonttype",
+            "gstatetype",
+            "integertype",
+            "marktype",
+            "nametype",
+            "nulltype",
+            "operatortype",
+            "packedarraytype",
+            "realtype",
+            "savetype",
+            "stringtype",
+        ] {
+            systemdict
+                .borrow_mut()
+                .insert(type_name.to_string(), Value::LiteralName(type_name.to_string()));
+        }
+        systemdict.borrow_mut().insert(
+            "StandardEncoding".to_string(),
+            Value::new_array(vec![Value::LiteralName(".notdef".to_string()); 256]),
+        );
 
         interp.dict_stack.push(systemdict);
         interp.dict_stack.push(userdict);
@@ -177,6 +206,12 @@ impl Interpreter {
             Value::Name(name) => {
                 self.execute_name(&name, lexer)?;
             }
+            Value::ImmediateName(name) => {
+                let value = self
+                    .lookup_dict(&name)
+                    .ok_or_else(|| PsError::Undefined(name.clone()))?;
+                self.operand_stack.push(value);
+            }
             other => {
                 self.operand_stack.push(other);
             }
@@ -210,7 +245,23 @@ impl Interpreter {
         // 2. Built-in operators dispatch
         match self.dispatch_builtin(name, lexer) {
             Ok(true) => return Ok(()),
-            Err(e) => return Err(PsError::SyntaxError(format!("operator '{}' failed: {}", name, e))),
+            Err(e) => {
+                let stack_tail = self
+                    .operand_stack
+                    .iter()
+                    .rev()
+                    .take(8)
+                    .map(|value| format!("{value:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(PsError::SyntaxError(format!(
+                    "operator '{}' failed at byte {}: {} (stack top: [{}])",
+                    name,
+                    lexer.position(),
+                    e,
+                    stack_tail
+                )));
+            }
             Ok(false) => {}
         }
 
@@ -257,9 +308,19 @@ impl Interpreter {
                 let len = self.operand_stack.len() as i64;
                 self.operand_stack.push(Value::Integer(len));
             }
-            "mark" | "[" => self.operand_stack.push(Value::Mark),
+            "counttomark" => {
+                let count = self
+                    .operand_stack
+                    .iter()
+                    .rev()
+                    .position(|value| matches!(value, Value::Mark))
+                    .ok_or(PsError::StackUnderflow)?;
+                self.operand_stack.push(Value::Integer(count as i64));
+            }
+            "mark" | "[" | "<<" => self.operand_stack.push(Value::Mark),
             "cleartomark" => self.op_cleartomark()?,
             "]" => self.op_close_bracket()?,
+            ">>" => self.op_close_dict()?,
 
             // Arithmetic & Math
             "add" => self.op_bin_num(|a, b| Ok(a + b))?,
@@ -279,6 +340,16 @@ impl Interpreter {
                 let a = self.pop_i64()?;
                 if b == 0 { return Err(PsError::UndefinedResult); }
                 self.operand_stack.push(Value::Integer(a % b));
+            }
+            "bitshift" => {
+                let shift = self.pop_i64()?;
+                let value = self.pop_i64()?;
+                let shifted = if shift >= 0 {
+                    value.wrapping_shl(shift.min(63) as u32)
+                } else {
+                    value.wrapping_shr((-shift).min(63) as u32)
+                };
+                self.operand_stack.push(Value::Integer(shifted));
             }
             "neg" => {
                 let val = self.pop_num()?;
@@ -396,8 +467,17 @@ impl Interpreter {
             }
             "known" => {
                 let key = self.pop_key_name()?;
-                let dict = self.pop_dict()?;
-                let is_known = dict.borrow().contains_key(&key);
+                let dict = self.pop_value()?;
+                let is_known = match dict {
+                    Value::Dict(dict) => dict.borrow().contains_key(&key),
+                    Value::Null => false,
+                    other => {
+                        return Err(PsError::TypeCheck {
+                            expected: "dict",
+                            got: other.type_name().to_string(),
+                        });
+                    }
+                };
                 self.operand_stack.push(Value::Bool(is_known));
             }
             "get" => {
@@ -453,6 +533,28 @@ impl Interpreter {
                             arr.push(val);
                         } else {
                             return Err(PsError::RangeCheck("array index out of bounds".to_string()));
+                        }
+                    }
+                    Value::String(mut string) => {
+                        let idx = key_or_index.as_i64()? as usize;
+                        let byte = val.as_i64()? as u8;
+                        if idx >= string.len() {
+                            return Err(PsError::RangeCheck("string index out of bounds".to_string()));
+                        }
+
+                        let original = string.clone();
+                        string[idx] = byte;
+
+                        // Strings are currently represented by value rather
+                        // than a shared composite object. Keep duplicated
+                        // operand-stack copies synchronized for idioms such
+                        // as `dup 0 71 put cvn`.
+                        for stack_value in &mut self.operand_stack {
+                            if let Value::String(other) = stack_value {
+                                if *other == original {
+                                    other[idx] = byte;
+                                }
+                            }
                         }
                     }
                     _ => return Err(PsError::TypeCheck { expected: "dict or array", got: container.type_name().to_string() }),
@@ -543,6 +645,57 @@ impl Interpreter {
                         self.operand_stack.push(Value::new_dict());
                     }
                 }
+            }
+            "currentglobal" => {
+                // The native VM currently uses a single dictionary/memory
+                // space. Report local VM mode and accept setglobal below so
+                // embedded Ghostscript-generated EPS prologs can initialize.
+                self.operand_stack.push(Value::Bool(false));
+            }
+            "setglobal" => {
+                let _global = self.pop_bool()?;
+            }
+            "gstate" => {
+                // Use a lightweight placeholder for PostScript gstate
+                // objects. The renderer already models the active graphics
+                // state directly, so embedded EPS setup can pass this object
+                // through setgstate without requiring a second VM type.
+                self.operand_stack.push(Value::new_dict());
+            }
+            "setgstate" => {
+                let _state = self.pop_value()?;
+            }
+            "currentblackgeneration" | "currentundercolorremoval" | "currentcolortransfer" => {
+                self.operand_stack.push(Value::new_proc(Vec::new()));
+            }
+            "currenthalftone" => {
+                self.operand_stack.push(Value::new_dict());
+            }
+            "currentpagedevice" => {
+                self.operand_stack.push(Value::new_dict());
+            }
+            "defineresource" => {
+                let _category = self.pop_key_name()?;
+                let value = self.pop_value()?;
+                self.operand_stack.push(value);
+            }
+            "findresource" => {
+                let category = self.pop_key_name()?;
+                let name = self.pop_key_name()?;
+                let value = if category == "Encoding" {
+                    self.lookup_dict(&name).unwrap_or_else(|| Value::new_array(vec![
+                        Value::LiteralName(".notdef".to_string());
+                        256
+                    ]))
+                } else {
+                    Value::new_dict()
+                };
+                self.operand_stack.push(value);
+            }
+            "resourcestatus" => {
+                let _category = self.pop_key_name()?;
+                let _name = self.pop_key_name()?;
+                self.operand_stack.push(Value::Bool(false));
             }
             "FontDirectory" => {
                 let dict = Rc::new(RefCell::new(HashMap::new()));
@@ -636,6 +789,61 @@ impl Interpreter {
                     _ => {}
                 }
             }
+            "search" => {
+                let seek_val = self.pop_value()?;
+                let str_val = self.pop_value()?;
+                match (str_val, seek_val) {
+                    (Value::String(s), Value::String(seek)) => {
+                        if seek.is_empty() {
+                            self.operand_stack.push(Value::String(s));
+                            self.operand_stack.push(Value::String(Vec::new()));
+                            self.operand_stack.push(Value::String(Vec::new()));
+                            self.operand_stack.push(Value::Bool(true));
+                        } else if let Some(pos) = s.windows(seek.len()).position(|window| window == seek.as_slice()) {
+                            let pre = s[..pos].to_vec();
+                            let match_str = s[pos..pos + seek.len()].to_vec();
+                            let post = s[pos + seek.len()..].to_vec();
+                            self.operand_stack.push(Value::String(post));
+                            self.operand_stack.push(Value::String(match_str));
+                            self.operand_stack.push(Value::String(pre));
+                            self.operand_stack.push(Value::Bool(true));
+                        } else {
+                            self.operand_stack.push(Value::String(s));
+                            self.operand_stack.push(Value::Bool(false));
+                        }
+                    }
+                    (s, seek) => {
+                        return Err(PsError::TypeCheck {
+                            expected: "string and string",
+                            got: format!("{} and {}", s.type_name(), seek.type_name()),
+                        });
+                    }
+                }
+            }
+            "anchorsearch" => {
+                let seek_val = self.pop_value()?;
+                let str_val = self.pop_value()?;
+                match (str_val, seek_val) {
+                    (Value::String(s), Value::String(seek)) => {
+                        if s.starts_with(&seek) {
+                            let match_str = s[..seek.len()].to_vec();
+                            let post = s[seek.len()..].to_vec();
+                            self.operand_stack.push(Value::String(post));
+                            self.operand_stack.push(Value::String(match_str));
+                            self.operand_stack.push(Value::Bool(true));
+                        } else {
+                            self.operand_stack.push(Value::String(s));
+                            self.operand_stack.push(Value::Bool(false));
+                        }
+                    }
+                    (s, seek) => {
+                        return Err(PsError::TypeCheck {
+                            expected: "string and string",
+                            got: format!("{} and {}", s.type_name(), seek.type_name()),
+                        });
+                    }
+                }
+            }
             "readhexstring" => {
                 let str_buf = self.pop_value()?;
                 let _file = self.pop_value().ok();
@@ -683,42 +891,15 @@ impl Interpreter {
                         let w = d.borrow().get("Width").and_then(|v| v.as_i64().ok()).unwrap_or(1) as usize;
                         let h = d.borrow().get("Height").and_then(|v| v.as_i64().ok()).unwrap_or(1) as usize;
 
-                        // Read hex stream from lexer
-                        let remaining = lexer.remaining_bytes();
-                        let mut hex_end = 0;
-                        while hex_end < remaining.len() && remaining[hex_end] != b'>' && remaining[hex_end] != b'~' {
-                            if remaining[hex_end] == b'%' || remaining[hex_end] == b'\n' || remaining[hex_end] == b'\r' || remaining[hex_end].is_ascii_hexdigit() || remaining[hex_end].is_ascii_whitespace() {
-                                hex_end += 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        let hex_slice = &remaining[..hex_end];
-                        lexer.set_position(lexer.position() + hex_end + if hex_end < remaining.len() && remaining[hex_end] == b'>' { 1 } else { 0 });
-
-                        // Convert hex to raw bytes
-                        let mut raw_bytes = Vec::new();
-                        let mut hi_nibble: Option<u8> = None;
-                        for &b in hex_slice {
-                            let nibble = match b {
-                                b'0'..=b'9' => b - b'0',
-                                b'a'..=b'f' => b - b'a' + 10,
-                                b'A'..=b'F' => b - b'A' + 10,
-                                _ => continue,
-                            };
-                            if let Some(hi) = hi_nibble.take() {
-                                raw_bytes.push((hi << 4) | nibble);
-                            } else {
-                                hi_nibble = Some(nibble);
-                            }
-                        }
+                        let data_source = d.borrow().get("DataSource").cloned();
+                        let raw_bytes = read_image_data(lexer, data_source.as_ref());
 
                         let mut rgba = Vec::with_capacity(w * h * 4);
                         if let Ok(dyn_img) = image::load_from_memory(&raw_bytes) {
                             let rgba_img = dyn_img.to_rgba8();
                             rgba = rgba_img.into_raw();
                         } else {
-                            let decompressed = if raw_bytes.starts_with(&[0x78]) || raw_bytes.len() >= 2 {
+                            let decompressed = if raw_bytes.starts_with(&[0x78]) {
                                 miniz_oxide::inflate::decompress_to_vec_zlib(&raw_bytes).unwrap_or(raw_bytes)
                             } else {
                                 raw_bytes
@@ -758,7 +939,13 @@ impl Interpreter {
                                 Matrix2D::scale(1.0 / (w as f64), 1.0 / (h as f64))
                             };
                             let transform = img_matrix.concat(&self.current_gstate.ctm);
-                            self.render_target.push_image(w as u32, h as u32, rgba, transform);
+                            self.render_target.push_image(
+                                w as u32,
+                                h as u32,
+                                rgba,
+                                transform,
+                                self.current_gstate.clip_paths.clone(),
+                            );
                         }
                     }
                     proc => {
@@ -796,7 +983,7 @@ impl Interpreter {
                     Value::Real(_) => "realtype",
                     Value::Bool(_) => "booleantype",
                     Value::String(_) => "stringtype",
-                    Value::LiteralName(_) | Value::Name(_) => "nametype",
+                    Value::LiteralName(_) | Value::Name(_) | Value::ImmediateName(_) => "nametype",
                     Value::Dict(_) => "dicttype",
                     Value::Array(_) | Value::ExecutableArray(_) => "arraytype",
                     Value::Mark => "marktype",
@@ -873,7 +1060,7 @@ impl Interpreter {
             "readonly" | "executeonly" | "noaccess" => {
                 // Return operand itself
             }
-            "rcheck" | "wcheck" | "xcheck" => {
+            "gcheck" | "rcheck" | "wcheck" | "xcheck" => {
                 let _val = self.pop_value()?;
                 self.operand_stack.push(Value::Bool(true));
             }
@@ -1001,6 +1188,18 @@ impl Interpreter {
                 }
             }
             "exit" => return Err(PsError::Exit),
+            "stop" => return Err(PsError::Stop),
+            "stopped" => {
+                let proc = self.pop_value()?;
+                let operand_stack_len = self.operand_stack.len();
+                match self.execute_proc_value(proc, lexer) {
+                    Ok(()) => self.operand_stack.push(Value::Bool(false)),
+                    Err(PsError::Stop) | Err(_) => {
+                        self.operand_stack.truncate(operand_stack_len);
+                        self.operand_stack.push(Value::Bool(true));
+                    }
+                }
+            }
             "exec" => {
                 let val = self.pop_value()?;
                 self.execute_proc_value(val, lexer)?;
@@ -1144,13 +1343,33 @@ impl Interpreter {
             // Painting
             "fill" => {
                 let transformed_path = self.current_gstate.current_path.transform(&self.current_gstate.ctm);
-                self.render_target.push_fill(transformed_path, self.current_gstate.color, false);
+                self.render_target.push_fill(
+                    transformed_path,
+                    self.current_gstate.color,
+                    false,
+                    self.current_gstate.clip_paths.clone(),
+                );
                 self.current_gstate.current_path.clear();
                 self.current_gstate.current_point = None;
             }
             "eofill" => {
                 let transformed_path = self.current_gstate.current_path.transform(&self.current_gstate.ctm);
-                self.render_target.push_fill(transformed_path, self.current_gstate.color, true);
+                self.render_target.push_fill(
+                    transformed_path,
+                    self.current_gstate.color,
+                    true,
+                    self.current_gstate.clip_paths.clone(),
+                );
+                self.current_gstate.current_path.clear();
+                self.current_gstate.current_point = None;
+            }
+            "clip" | "eoclip" => {
+                if !self.current_gstate.current_path.is_empty() {
+                    self.current_gstate.clip_paths.push(crate::gstate::ClipPath {
+                        path: self.current_gstate.current_path.transform(&self.current_gstate.ctm),
+                        even_odd: name == "eoclip",
+                    });
+                }
                 self.current_gstate.current_path.clear();
                 self.current_gstate.current_point = None;
             }
@@ -1164,6 +1383,7 @@ impl Interpreter {
                     self.current_gstate.line_cap,
                     self.current_gstate.line_join,
                     self.current_gstate.miter_limit,
+                    self.current_gstate.clip_paths.clone(),
                 );
                 self.current_gstate.current_path.clear();
                 self.current_gstate.current_point = None;
@@ -1185,9 +1405,16 @@ impl Interpreter {
                 let w = self.pop_num()?;
                 self.current_gstate.line_width = w;
             }
+            "currentlinewidth" => {
+                self.operand_stack.push(Value::Real(self.current_gstate.line_width));
+            }
             "setgray" => {
                 let g = self.pop_num()?;
                 self.current_gstate.color = Color::gray(g);
+            }
+            "currentgray" => {
+                let g = 0.299 * self.current_gstate.color.r + 0.587 * self.current_gstate.color.g + 0.114 * self.current_gstate.color.b;
+                self.operand_stack.push(Value::Real(g));
             }
             "setrgbcolor" => {
                 let b = self.pop_num()?;
@@ -1195,12 +1422,37 @@ impl Interpreter {
                 let r = self.pop_num()?;
                 self.current_gstate.color = Color::rgb(r, g, b);
             }
+            "currentrgbcolor" => {
+                self.operand_stack.push(Value::Real(self.current_gstate.color.r));
+                self.operand_stack.push(Value::Real(self.current_gstate.color.g));
+                self.operand_stack.push(Value::Real(self.current_gstate.color.b));
+            }
             "setcmykcolor" => {
                 let k = self.pop_num()?;
                 let y = self.pop_num()?;
                 let m = self.pop_num()?;
                 let c = self.pop_num()?;
                 self.current_gstate.color = Color::cmyk(c, m, y, k);
+            }
+            "currentcmykcolor" => {
+                let r = self.current_gstate.color.r;
+                let g = self.current_gstate.color.g;
+                let b = self.current_gstate.color.b;
+                let k = 1.0 - r.max(g).max(b);
+                if (1.0 - k).abs() < 1e-6 {
+                    self.operand_stack.push(Value::Real(0.0));
+                    self.operand_stack.push(Value::Real(0.0));
+                    self.operand_stack.push(Value::Real(0.0));
+                    self.operand_stack.push(Value::Real(1.0));
+                } else {
+                    let c = (1.0 - r - k) / (1.0 - k);
+                    let m = (1.0 - g - k) / (1.0 - k);
+                    let y = (1.0 - b - k) / (1.0 - k);
+                    self.operand_stack.push(Value::Real(c.clamp(0.0, 1.0)));
+                    self.operand_stack.push(Value::Real(m.clamp(0.0, 1.0)));
+                    self.operand_stack.push(Value::Real(y.clamp(0.0, 1.0)));
+                    self.operand_stack.push(Value::Real(k.clamp(0.0, 1.0)));
+                }
             }
             "setlinecap" => {
                 let cap = self.pop_i64()?;
@@ -1210,6 +1462,14 @@ impl Interpreter {
                     _ => LineCap::Butt,
                 };
             }
+            "currentlinecap" => {
+                let cap = match self.current_gstate.line_cap {
+                    LineCap::Butt => 0,
+                    LineCap::Round => 1,
+                    LineCap::Square => 2,
+                };
+                self.operand_stack.push(Value::Integer(cap));
+            }
             "setlinejoin" => {
                 let join = self.pop_i64()?;
                 self.current_gstate.line_join = match join {
@@ -1218,9 +1478,20 @@ impl Interpreter {
                     _ => LineJoin::Miter,
                 };
             }
+            "currentlinejoin" => {
+                let join = match self.current_gstate.line_join {
+                    LineJoin::Miter => 0,
+                    LineJoin::Round => 1,
+                    LineJoin::Bevel => 2,
+                };
+                self.operand_stack.push(Value::Integer(join));
+            }
             "setmiterlimit" => {
                 let limit = self.pop_num()?;
                 self.current_gstate.miter_limit = limit;
+            }
+            "currentmiterlimit" => {
+                self.operand_stack.push(Value::Real(self.current_gstate.miter_limit));
             }
 
             // Coordinate Transforms
@@ -1562,7 +1833,12 @@ impl Interpreter {
                         if let Some((glyph_path, width)) = f.get_glyph_path(&glyph_name) {
                             let placed = glyph_path.transform(&Matrix2D::translate(cx, cy));
                             let transformed = placed.transform(&self.current_gstate.ctm);
-                            self.render_target.push_fill(transformed, self.current_gstate.color, false);
+                            self.render_target.push_fill(
+                                transformed,
+                                self.current_gstate.color,
+                                false,
+                                self.current_gstate.clip_paths.clone(),
+                            );
                             cx += width;
                             continue;
                         }
@@ -1910,6 +2186,167 @@ impl Interpreter {
             Value::Real(m.ty),
         ])
     }
+}
+
+fn read_image_data(lexer: &mut Lexer<'_>, data_source: Option<&Value>) -> Vec<u8> {
+    let mut filters = Vec::new();
+    let mut source = data_source.cloned();
+
+    while let Some(Value::Dict(dict)) = source {
+        let (filter, next_source) = {
+            let dict = dict.borrow();
+            (
+                dict.get("Filter").map(Value::as_str_lossy),
+                dict.get("Source").cloned(),
+            )
+        };
+        if let Some(filter) = filter {
+            filters.push(filter);
+        }
+        source = next_source;
+    }
+
+    if filters.iter().any(|filter| filter == "ASCII85Decode") {
+        let encoded = read_until_ascii85_end(lexer);
+        let ascii85 = decode_ascii85(&encoded);
+        if filters.iter().any(|filter| filter == "RunLengthDecode") {
+            return decode_run_length(&ascii85);
+        }
+        return ascii85;
+    }
+
+    read_hex_image_data(lexer)
+}
+
+fn read_until_ascii85_end(lexer: &mut Lexer<'_>) -> Vec<u8> {
+    let remaining = lexer.remaining_bytes();
+    let end = remaining
+        .windows(2)
+        .position(|window| window == b"~>")
+        .unwrap_or(remaining.len());
+    let data = remaining[..end].to_vec();
+    lexer.set_position(lexer.position() + end + if end < remaining.len() { 2 } else { 0 });
+    data
+}
+
+fn decode_ascii85(input: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::new();
+    let mut tuple: u64 = 0;
+    let mut count = 0usize;
+
+    for &byte in input {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if byte == b'z' && count == 0 {
+            decoded.extend_from_slice(&[0, 0, 0, 0]);
+            continue;
+        }
+        if !(b'!'..=b'u').contains(&byte) {
+            continue;
+        }
+
+        tuple = tuple * 85 + u64::from(byte - b'!');
+        count += 1;
+        if count == 5 {
+            decoded.push((tuple >> 24) as u8);
+            decoded.push((tuple >> 16) as u8);
+            decoded.push((tuple >> 8) as u8);
+            decoded.push(tuple as u8);
+            tuple = 0;
+            count = 0;
+        }
+    }
+
+    if count > 0 {
+        for _ in count..5 {
+            tuple = tuple * 85 + 84;
+        }
+        for shift in (1..count).rev() {
+            decoded.push((tuple >> (shift * 8)) as u8);
+        }
+    }
+
+    decoded
+}
+
+fn decode_run_length(input: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::new();
+    let mut offset = 0usize;
+
+    while offset < input.len() {
+        let length = input[offset];
+        offset += 1;
+
+        match length {
+            0..=127 => {
+                let count = usize::from(length) + 1;
+                let end = (offset + count).min(input.len());
+                decoded.extend_from_slice(&input[offset..end]);
+                offset = end;
+            }
+            128 => break,
+            129..=255 => {
+                if offset >= input.len() {
+                    break;
+                }
+                let value = input[offset];
+                offset += 1;
+                decoded.extend(std::iter::repeat_n(value, 257 - usize::from(length)));
+            }
+        }
+    }
+
+    decoded
+}
+
+fn read_hex_image_data(lexer: &mut Lexer<'_>) -> Vec<u8> {
+    let remaining = lexer.remaining_bytes();
+    let mut hex_end = 0;
+    while hex_end < remaining.len() && remaining[hex_end] != b'>' && remaining[hex_end] != b'~' {
+        if remaining[hex_end] == b'%'
+            || remaining[hex_end] == b'\n'
+            || remaining[hex_end] == b'\r'
+            || remaining[hex_end].is_ascii_hexdigit()
+            || remaining[hex_end].is_ascii_whitespace()
+        {
+            hex_end += 1;
+        } else {
+            break;
+        }
+    }
+
+    let hex_slice = &remaining[..hex_end];
+    lexer.set_position(
+        lexer.position()
+            + hex_end
+            + if hex_end < remaining.len() && remaining[hex_end] == b'>' {
+                1
+            } else {
+                0
+            },
+    );
+
+    let mut decoded = Vec::new();
+    let mut high_nibble = None;
+    for &byte in hex_slice {
+        let nibble = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => continue,
+        };
+        if let Some(high) = high_nibble.take() {
+            decoded.push((high << 4) | nibble);
+        } else {
+            high_nibble = Some(nibble);
+        }
+    }
+    if let Some(high) = high_nibble {
+        decoded.push(high << 4);
+    }
+
+    decoded
 }
 
 fn format_radix(val: i64, radix: u32) -> String {

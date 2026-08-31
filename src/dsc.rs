@@ -31,6 +31,7 @@ pub struct DscDocument {
     pub bounding_box: Option<BoundingBox>,
     pub hires_bounding_box: Option<BoundingBox>,
     pub total_pages: Option<usize>,
+    pub page_size: Option<(f64, f64)>,
     pub prolog_range: Option<(usize, usize)>,
     pub setup_range: Option<(usize, usize)>,
     pub preamble_range: Option<(usize, usize)>,
@@ -45,6 +46,7 @@ impl DscDocument {
         let mut bounding_box = None;
         let mut hires_bounding_box = None;
         let mut total_pages = None;
+        let mut page_size = None;
         let mut pages = Vec::new();
 
         let mut prolog_start = None;
@@ -60,6 +62,10 @@ impl DscDocument {
         for line in text.split_inclusive('\n') {
             let line_len = line.len();
             let trimmed = line.trim();
+
+            if page_size.is_none() {
+                page_size = Self::parse_page_size(trimmed);
+            }
 
             if trimmed.starts_with("%%BeginDocument")
                 || trimmed.starts_with("%%BeginFont")
@@ -177,10 +183,49 @@ impl DscDocument {
             bounding_box,
             hires_bounding_box,
             total_pages,
+            page_size,
             prolog_range,
             setup_range,
             preamble_range,
             pages,
+        }
+    }
+
+    pub fn page_size(&self) -> (f64, f64) {
+        if let Some((width, height)) = self.page_size {
+            return (width, height);
+        }
+
+        if !self.pages.is_empty() {
+            return (612.0, 792.0);
+        }
+
+        if let Some(bbox) = &self.bounding_box {
+            return (bbox.width(), bbox.height());
+        }
+
+        if let Some(bbox) = &self.hires_bounding_box {
+            return (bbox.width(), bbox.height());
+        }
+
+        (612.0, 792.0)
+    }
+
+    fn parse_page_size(line: &str) -> Option<(f64, f64)> {
+        let start = line.find("/PageSize")?;
+        let array = line[start..].find('[')? + start + 1;
+        let end = line[array..].find(']')? + array;
+        let parts: Vec<&str> = line[array..end].split_whitespace().collect();
+        if parts.len() < 2 {
+            return None;
+        }
+
+        let width = parts[0].parse::<f64>().ok()?;
+        let height = parts[1].parse::<f64>().ok()?;
+        if width > 0.0 && height > 0.0 {
+            Some((width, height))
+        } else {
+            None
         }
     }
 }
