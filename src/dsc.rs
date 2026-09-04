@@ -40,7 +40,6 @@ pub struct DscDocument {
 
 impl DscDocument {
     pub fn parse(input: &[u8]) -> Self {
-        let text = String::from_utf8_lossy(input);
         let mut title = None;
         let mut creator = None;
         let mut bounding_box = None;
@@ -59,11 +58,11 @@ impl DscDocument {
         let mut nesting_depth: usize = 0;
 
         let mut offset = 0;
-        for line in text.split_inclusive('\n') {
+        for line in input.split_inclusive(|&b| b == b'\n') {
             let line_len = line.len();
-            let trimmed = line.trim();
+            let trimmed = std::str::from_utf8(line).unwrap_or("").trim();
 
-            if page_size.is_none() {
+            if page_size.is_none() && !trimmed.is_empty() {
                 page_size = Self::parse_page_size(trimmed);
             }
 
