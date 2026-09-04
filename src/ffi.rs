@@ -152,3 +152,97 @@ pub unsafe extern "C" fn ps_document_free(handle: *mut PsDocumentHandle) {
         }
     }
 }
+
+pub struct PsInterpHandle {
+    interp: Interpreter,
+    page_h: f64,
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ps_interp_create(
+    page_w: f64,
+    page_h: f64,
+    pixel_w: u32,
+    pixel_h: u32,
+) -> *mut PsInterpHandle {
+    if pixel_w == 0 || pixel_h == 0 {
+        return std::ptr::null_mut();
+    }
+    let interp = Interpreter::with_page_size(page_w, page_h, pixel_w, pixel_h);
+    let handle = Box::new(PsInterpHandle {
+        interp,
+        page_h,
+    });
+    Box::into_raw(handle)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ps_interp_execute(
+    handle: *mut PsInterpHandle,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    if handle.is_null() || data.is_null() || len == 0 {
+        return -1;
+    }
+    let handle = unsafe { &mut *handle };
+    let slice = unsafe { slice::from_raw_parts(data, len) };
+    if let Err(e) = handle.interp.execute_bytes(slice) {
+        eprintln!("ps_interp_execute error: {}", e);
+        return -1;
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ps_interp_set_current_point(
+    handle: *mut PsInterpHandle,
+    x: f64,
+    y: f64,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *handle };
+    // Set current point in user coordinate space
+    handle.interp.set_current_point_user(x, y);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ps_interp_render_rgba(
+    handle: *mut PsInterpHandle,
+    out_rgba_buffer: *mut u8,
+    width: u32,
+    height: u32,
+) -> i32 {
+    if handle.is_null() || out_rgba_buffer.is_null() || width == 0 || height == 0 {
+        return -1;
+    }
+    let handle = unsafe { &mut *handle };
+    let target = handle.interp.pages_rendered.last().unwrap_or(&handle.interp.render_target);
+    // Render with transparent background (alpha = 0) so it overlays correctly on the page
+    let transparent = Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+    match target.render_to_pixmap(transparent) {
+        Ok(pixmap) => {
+            let pixels = pixmap.data();
+            let byte_count = (width * height * 4) as usize;
+            if pixels.len() != byte_count {
+                return -1;
+            }
+            let dest = unsafe { slice::from_raw_parts_mut(out_rgba_buffer, byte_count) };
+            dest.copy_from_slice(pixels);
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ps_interp_free(handle: *mut PsInterpHandle) {
+    if !handle.is_null() {
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    }
+}

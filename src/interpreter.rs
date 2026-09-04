@@ -110,6 +110,22 @@ impl Interpreter {
             Value::new_array(vec![Value::LiteralName(".notdef".to_string()); 256]),
         );
 
+        // Standard dvips variables and helpers
+        let sdict = Rc::new(RefCell::new(HashMap::new()));
+        sdict.borrow_mut().insert("H.S".to_string(), Value::new_array(vec![]));
+        sdict.borrow_mut().insert("H.R".to_string(), Value::new_array(vec![]));
+        sdict.borrow_mut().insert("H.V".to_string(), Value::Real(0.0));
+        systemdict.borrow_mut().insert("SDict".to_string(), Value::Dict(sdict.clone()));
+        userdict.borrow_mut().insert("SDict".to_string(), Value::Dict(sdict));
+
+        userdict.borrow_mut().insert("Resolution".to_string(), Value::Real(72.0));
+        userdict.borrow_mut().insert("VResolution".to_string(), Value::Real(72.0));
+        userdict.borrow_mut().insert("magscale".to_string(), Value::Bool(false));
+        userdict.borrow_mut().insert("DVImag".to_string(), Value::Real(1000.0));
+        userdict.borrow_mut().insert("@beginspecial".to_string(), Value::new_array(vec![]));
+        userdict.borrow_mut().insert("@endspecial".to_string(), Value::new_array(vec![]));
+        systemdict.borrow_mut().insert("pdfmark".to_string(), Value::LiteralName("cleartomark".to_string()));
+
         interp.dict_stack.push(systemdict);
         interp.dict_stack.push(userdict);
 
@@ -1602,6 +1618,10 @@ impl Interpreter {
             "currentmiterlimit" => {
                 self.operand_stack.push(Value::Real(self.current_gstate.miter_limit));
             }
+            ".setopacityalpha" | ".setfillconstantalpha" | ".setstrokeconstantalpha" => {
+                let alpha = self.pop_num()?;
+                self.current_gstate.color.a = alpha.clamp(0.0, 1.0);
+            }
 
             // Coordinate Transforms
             "translate" => {
@@ -2376,7 +2396,7 @@ impl Interpreter {
         Some(inv.transform_point(dx, dy))
     }
 
-    fn set_current_point_user(&mut self, ux: f64, uy: f64) {
+    pub fn set_current_point_user(&mut self, ux: f64, uy: f64) {
         let (dx, dy) = self.current_gstate.ctm.transform_point(ux, uy);
         self.current_gstate.current_point = Some((dx, dy));
     }
