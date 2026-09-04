@@ -122,12 +122,28 @@ impl Interpreter {
         userdict.borrow_mut().insert("VResolution".to_string(), Value::Real(72.0));
         userdict.borrow_mut().insert("magscale".to_string(), Value::Bool(false));
         userdict.borrow_mut().insert("DVImag".to_string(), Value::Real(1000.0));
-        userdict.borrow_mut().insert("@beginspecial".to_string(), Value::new_array(vec![]));
-        userdict.borrow_mut().insert("@endspecial".to_string(), Value::new_array(vec![]));
         systemdict.borrow_mut().insert("pdfmark".to_string(), Value::LiteralName("cleartomark".to_string()));
 
         interp.dict_stack.push(systemdict);
         interp.dict_stack.push(userdict);
+
+        // Define @beginspecial and @endspecial for inline dvips / TikZ specials
+        let _ = interp.execute_str("
+            userdict begin
+            /@beginspecial {
+                SDict begin
+                /SpecialSave save def
+                gsave
+                currentpoint translate
+                newpath
+            } bind def
+            /@endspecial {
+                grestore
+                SpecialSave restore
+                end
+            } bind def
+            end
+        ");
 
         // Preload common Computer Modern and standard fonts
         for font_name in &[
