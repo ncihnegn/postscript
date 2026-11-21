@@ -1,10 +1,12 @@
 pub mod charstring;
 pub mod eexec;
+pub mod pk;
 pub mod type1;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use crate::matrix::Matrix2D;
 use crate::path::Path;
 use crate::value::Value;
@@ -19,6 +21,8 @@ pub struct FontFace {
     pub charstrings: HashMap<String, GlyphOutline>,
     pub subrs: Vec<Vec<u8>>,
     pub type3_dict: Option<Rc<RefCell<HashMap<String, Value>>>>,
+    /// Bitmap source for fonts that have no Type 1 outlines, resolved on demand.
+    pub pk_font: Option<Arc<pk::PkFont>>,
 }
 
 impl FontFace {
@@ -37,6 +41,7 @@ impl FontFace {
             charstrings: HashMap::new(),
             subrs: Vec::new(),
             type3_dict: None,
+            pk_font: None,
         }
     }
 
@@ -88,6 +93,19 @@ impl FontFace {
             None
         }
     }
+
+    /// Fallback outline from a PK bitmap for characters this face cannot draw,
+    /// such as fonts that ship only as bitmaps (TeX's `manfnt`).
+    pub fn get_bitmap_glyph_path(&self, character_code: u8) -> Option<(Path, f64)> {
+        let font = match &self.pk_font {
+            Some(font) => font.clone(),
+            None => pk::load_pk_font(&self.name)?,
+        };
+        let (glyph_space_path, advance) = font.glyph_path(character_code as u32)?;
+        let transformed_path = glyph_space_path.transform(&self.matrix);
+        let (scaled_advance, _) = self.matrix.transform_vector(advance, 0.0);
+        Some((transformed_path, scaled_advance.abs()))
+    }
 }
 
 pub fn load_font_by_name(name: &str) -> Option<FontFace> {
@@ -111,6 +129,7 @@ pub fn load_font_by_name(name: &str) -> Option<FontFace> {
             charstrings,
             subrs,
             type3_dict: None,
+            pk_font: None,
         })
     } else {
         None

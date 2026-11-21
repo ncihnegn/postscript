@@ -1999,6 +1999,13 @@ impl Interpreter {
                             cx += width;
                             continue;
                         }
+                        if let Some((glyph_path, width)) = f.get_bitmap_glyph_path(b) {
+                            let placed = glyph_path.transform(&Matrix2D::translate(cx, cy));
+                            let transformed = placed.transform(&self.current_gstate.ctm);
+                            self.current_gstate.current_path.append(&transformed);
+                            cx += width;
+                            continue;
+                        }
                     }
 
                     // Fallback advance for standard characters
@@ -2029,6 +2036,18 @@ impl Interpreter {
                             continue;
                         }
                         if let Some((glyph_path, width)) = f.get_glyph_path(&glyph_name) {
+                            let placed = glyph_path.transform(&Matrix2D::translate(cx, cy));
+                            let transformed = placed.transform(&self.current_gstate.ctm);
+                            self.render_target.push_fill(
+                                transformed,
+                                self.current_gstate.color,
+                                false,
+                                self.current_gstate.clip_paths.clone(),
+                            );
+                            cx += width;
+                            continue;
+                        }
+                        if let Some((glyph_path, width)) = f.get_bitmap_glyph_path(b) {
                             let placed = glyph_path.transform(&Matrix2D::translate(cx, cy));
                             let transformed = placed.transform(&self.current_gstate.ctm);
                             self.render_target.push_fill(
