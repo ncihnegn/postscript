@@ -97,13 +97,24 @@ impl FontFace {
     /// Fallback outline from a PK bitmap for characters this face cannot draw,
     /// such as fonts that ship only as bitmaps (TeX's `manfnt`).
     pub fn get_bitmap_glyph_path(&self, character_code: u8) -> Option<(Path, f64)> {
+        self.get_bitmap_glyph_path_with_matrix(character_code, &self.matrix)
+    }
+
+    /// Same as `get_bitmap_glyph_path`, but with an explicit glyph-space matrix.
+    /// Type 3 faces bake their own FontMatrix into `matrix`, so they pass the
+    /// em-normalised scale instead.
+    pub fn get_bitmap_glyph_path_with_matrix(
+        &self,
+        character_code: u8,
+        matrix: &Matrix2D,
+    ) -> Option<(Path, f64)> {
         let font = match &self.pk_font {
             Some(font) => font.clone(),
             None => pk::load_pk_font(&self.name)?,
         };
         let (glyph_space_path, advance) = font.glyph_path(character_code as u32)?;
-        let transformed_path = glyph_space_path.transform(&self.matrix);
-        let (scaled_advance, _) = self.matrix.transform_vector(advance, 0.0);
+        let transformed_path = glyph_space_path.transform(matrix);
+        let (scaled_advance, _) = matrix.transform_vector(advance, 0.0);
         Some((transformed_path, scaled_advance.abs()))
     }
 }

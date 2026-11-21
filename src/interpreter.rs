@@ -2032,8 +2032,28 @@ impl Interpreter {
 
                     if let Some(f) = &font {
                         if f.type3_dict.is_some() {
-                            cx += self.render_type3_glyph(f, &glyph_name, cx, cy);
-                            continue;
+                            if let Some(advance) = self.render_type3_glyph(f, &glyph_name, cx, cy) {
+                                cx += advance;
+                                continue;
+                            }
+                            // Type 3 fonts that paint their glyphs with raw
+                            // CharProcs (e.g. dvips' bitmap fonts) have no
+                            // cached glyph record; fall through to the bitmap.
+                            let glyph_matrix = self.type3_bitmap_matrix(f);
+                            if let Some((glyph_path, width)) =
+                                f.get_bitmap_glyph_path_with_matrix(b, &glyph_matrix)
+                            {
+                                let placed = glyph_path.transform(&Matrix2D::translate(cx, cy));
+                                let transformed = placed.transform(&self.current_gstate.ctm);
+                                self.render_target.push_fill(
+                                    transformed,
+                                    self.current_gstate.color,
+                                    false,
+                                    self.current_gstate.clip_paths.clone(),
+                                );
+                                cx += width;
+                                continue;
+                            }
                         }
                         if let Some((glyph_path, width)) = f.get_glyph_path(&glyph_name) {
                             let placed = glyph_path.transform(&Matrix2D::translate(cx, cy));
@@ -2500,25 +2520,47 @@ impl Interpreter {
         );
     }
 
+    /// Glyph-space matrix for drawing this Type 3 face's PK bitmaps. Bitmap
+    /// paths are normalised to 1000 units per em, while `font.matrix` already
+    /// includes the Type 3 FontMatrix (1/83 for dvips' 600dpi bitmaps), so that
+    /// factor is divided out to recover the point size.
+    fn type3_bitmap_matrix(&self, font: &FontFace) -> Matrix2D {
+        let font_matrix = font
+            .type3_dict
+            .as_ref()
+            .and_then(|dict| dict.borrow().get("FontMatrix").cloned())
+            .and_then(|value| self.val_to_matrix(value).ok());
+        let size = match font_matrix {
+            Some(matrix) if matrix.a.abs() > 1e-9 => (font.matrix.a / matrix.a).abs(),
+            _ => 1000.0,
+        };
+        // Bitmap fonts are set with a y-down text matrix (dvips writes
+        // [size 0 0 -size 0 0]), so carry that flip over to the y-up bitmap.
+        let sx = if font.matrix.a < 0.0 { -1.0 } else { 1.0 };
+        let sy = if font.matrix.d < 0.0 { -1.0 } else { 1.0 };
+        Matrix2D::scale(sx * size / 1000.0, sy * size / 1000.0)
+    }
+
+    /// Paints a Type 3 glyph from its cached record. Returns the advance when the
+    /// glyph was drawn, or `None` when the font has no usable record for it.
     fn render_type3_glyph(
         &mut self,
         font: &FontFace,
         glyph_name: &str,
         current_x: f64,
         current_y: f64,
-    ) -> f64 {
-        let Some(font_dict) = &font.type3_dict else {
-            return 0.0;
-        };
+    ) -> Option<f64> {
+        let font_dict = font.type3_dict.as_ref()?;
         let record = {
             let dict = font_dict.borrow();
-            let Some(Value::Dict(char_data)) = dict.get("CD") else {
-                return 0.0;
+            let char_data = match dict.get("CD") {
+                Some(Value::Dict(char_data)) => char_data.clone(),
+                _ => return None,
             };
             char_data.borrow().get(glyph_name).cloned()
         };
-        let Some(Value::Array(record)) = record else {
-            return 0.0;
+        let Value::Array(record) = record? else {
+            return None;
         };
         let record = record.borrow();
         let advance = record
@@ -2541,10 +2583,11 @@ impl Interpreter {
                     .concat(&saved_ctm);
                 self.push_image_mask(width, height, data, true, Matrix2D::identity());
                 self.current_gstate.ctm = saved_ctm;
+                return Some(font.matrix.transform_vector(advance, 0.0).0);
             }
         }
 
-        font.matrix.transform_vector(advance, 0.0).0
+        None
     }
 
     fn matrix_to_val(&self, m: Matrix2D) -> Value {
