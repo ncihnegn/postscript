@@ -31,6 +31,7 @@ pub struct Interpreter {
     pub save_stack: Vec<SaveSnapshot>,
     pub next_save_id: u64,
     pub font_instances: Vec<FontFace>,
+    type3_char_width: Option<(f64, f64)>,
 }
 
 impl Interpreter {
@@ -58,6 +59,7 @@ impl Interpreter {
             save_stack: Vec::with_capacity(8),
             next_save_id: 1,
             font_instances: Vec::with_capacity(32),
+            type3_char_width: None,
         };
 
         // Initialize systemdict, userdict, statusdict, globaldict
@@ -1952,12 +1954,18 @@ impl Interpreter {
                 let _urx = self.pop_num().ok();
                 let _lly = self.pop_num().ok();
                 let _llx = self.pop_num().ok();
-                let _wy = self.pop_num().ok();
-                let _wx = self.pop_num().ok();
+                let wy = self.pop_num().ok();
+                let wx = self.pop_num().ok();
+                if let (Some(wx), Some(wy)) = (wx, wy) {
+                    self.type3_char_width = Some((wx, wy));
+                }
             }
             "setcharwidth" => {
-                let _wy = self.pop_num().ok();
-                let _wx = self.pop_num().ok();
+                let wy = self.pop_num().ok();
+                let wx = self.pop_num().ok();
+                if let (Some(wx), Some(wy)) = (wx, wy) {
+                    self.type3_char_width = Some((wx, wy));
+                }
             }
             "imagemask" => {
                 let source = self.pop_value()?;
@@ -2036,9 +2044,11 @@ impl Interpreter {
                                 cx += advance;
                                 continue;
                             }
-                            // Type 3 fonts that paint their glyphs with raw
-                            // CharProcs (e.g. dvips' bitmap fonts) have no
-                            // cached glyph record; fall through to the bitmap.
+                            if let Some(advance) = self.render_type3_charproc(f, &glyph_name, cx, cy) {
+                                cx += advance;
+                                continue;
+                            }
+                            // Type 3 fonts whose CharProcs cannot be executed directly fall back to PK bitmaps.
                             let glyph_matrix = self.type3_bitmap_matrix(f);
                             if let Some((glyph_path, width)) =
                                 f.get_bitmap_glyph_path_with_matrix(b, &glyph_matrix)
@@ -2588,6 +2598,58 @@ impl Interpreter {
         }
 
         None
+    }
+
+    /// Executes an embedded Type 3 `/CharProcs` procedure for `glyph_name`.
+    fn render_type3_charproc(
+        &mut self,
+        font: &FontFace,
+        glyph_name: &str,
+        current_x: f64,
+        current_y: f64,
+    ) -> Option<f64> {
+        let font_dict = font.type3_dict.as_ref()?.clone();
+        let proc_val = {
+            let dict = font_dict.borrow();
+            let Value::Dict(char_procs) = dict.get("CharProcs")? else {
+                return None;
+            };
+            let proc = char_procs.borrow().get(glyph_name).cloned()?;
+            match proc {
+                Value::ExecutableArray(_) | Value::Name(_) => proc,
+                _ => return None,
+            }
+        };
+
+        let saved_gstate = self.current_gstate.clone();
+        let saved_gstack_len = self.gstate_stack.len();
+        let saved_stack_len = self.operand_stack.len();
+        let saved_dict_len = self.dict_stack.len();
+        let saved_char_width = self.type3_char_width.take();
+
+        self.current_gstate.ctm = font
+            .matrix
+            .concat(&Matrix2D::translate(current_x, current_y))
+            .concat(&saved_gstate.ctm);
+        self.current_gstate.current_path = Path::new();
+        self.dict_stack.push(font_dict);
+
+        let mut empty_lexer = Lexer::new(b"");
+        let exec_result = self.execute_proc_value(proc_val, &mut empty_lexer);
+        let char_width = self.type3_char_width.take();
+
+        self.dict_stack.truncate(saved_dict_len);
+        self.operand_stack.truncate(saved_stack_len);
+        self.gstate_stack.truncate(saved_gstack_len);
+        self.current_gstate = saved_gstate;
+        self.type3_char_width = saved_char_width;
+
+        if exec_result.is_ok() {
+            let (wx, wy) = char_width.unwrap_or((0.0, 0.0));
+            Some(font.matrix.transform_vector(wx, wy).0)
+        } else {
+            None
+        }
     }
 
     fn matrix_to_val(&self, m: Matrix2D) -> Value {

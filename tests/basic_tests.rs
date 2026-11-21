@@ -84,6 +84,47 @@ fn test_type3_font_show_renders_bitmap_glyphs() {
 }
 
 #[test]
+fn test_type3_charprocs_imagemask_renders_glyph() {
+    let mut interp = Interpreter::new(100, 100);
+    interp
+        .execute_str(
+            "
+            /NonexistentSyntheticType3Font 10 dict dup begin
+            /FontType 3 def
+            /FontMatrix [0.5 0 0 0.5 0 0] def
+            /Encoding 256 array def
+            0 1 255 { Encoding exch /.notdef put } for
+            Encoding 33 /c33 put
+            /CharProcs 1 dict def
+            CharProcs begin
+            /c33 {
+                20 0 0 0 8 8 setcachedevice
+                8 8 true [1 0 0 -1 0 8] <FF818181818181FF> imagemask
+            } bind def
+            end
+            /BuildChar { exch begin Encoding exch get CharProcs exch get exec end } bind def
+            end
+            /NonexistentSyntheticType3Font exch definefont pop
+            /NonexistentSyntheticType3Font findfont 1 scalefont setfont
+            10 10 moveto
+            (!) show
+            currentpoint
+            ",
+        )
+        .unwrap();
+
+    assert!(interp
+        .render_target
+        .commands
+        .iter()
+        .any(|command| matches!(command, DrawCommand::Image { width: 8, height: 8, .. })));
+    let y = interp.operand_stack.pop().unwrap().as_f64().unwrap();
+    let x = interp.operand_stack.pop().unwrap().as_f64().unwrap();
+    assert!((x - 20.0).abs() < 1e-6, "expected x=20.0 (10 + 20*0.5), got {x}");
+    assert!((y - 10.0).abs() < 1e-6, "expected y=10.0, got {y}");
+}
+
+#[test]
 fn test_stopped_catches_errors_and_stop() {
     let mut interp = Interpreter::new(100, 100);
     interp.execute_str("7 { 2 3 add } stopped").unwrap();
