@@ -86,7 +86,15 @@ pub unsafe extern "C" fn ps_document_render_page_rgba(
         }
     }
 
-    let target = interp.pages_rendered.last().unwrap_or(&interp.render_target);
+    let target = if !doc.dsc.pages.is_empty() {
+        interp.pages_rendered.last().unwrap_or(&interp.render_target)
+    } else {
+        interp
+            .pages_rendered
+            .get(page_index)
+            .or_else(|| interp.pages_rendered.last())
+            .unwrap_or(&interp.render_target)
+    };
     match target.render_to_pixmap(Color::WHITE) {
         Ok(pixmap) => {
             let pixels = pixmap.data();
