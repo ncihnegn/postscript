@@ -270,9 +270,133 @@ pub fn load_pk_font(name: &str) -> Option<Arc<PkFont>> {
     font
 }
 
+fn pk_file_index() -> &'static HashMap<String, PathBuf> {
+    static PK_INDEX: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
+    PK_INDEX.get_or_init(|| {
+        let mut index = HashMap::new();
+        let mut roots: Vec<PathBuf> = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir("/usr/local/texlive") {
+            let mut subdirs: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok().map(|entry| entry.path()))
+                .filter(|p| p.is_dir())
+                .collect();
+            subdirs.sort();
+            subdirs.reverse();
+            for sub in subdirs {
+                roots.push(sub.join("texmf-var/fonts/pk"));
+                roots.push(sub.join("texmf-dist/fonts/pk"));
+            }
+        }
+
+        for fixed in [
+            "/Library/TeX/Root/texmf-var/fonts/pk",
+            "/Library/TeX/Root/texmf-dist/fonts/pk",
+            "/opt/homebrew/share/texmf-var/fonts/pk",
+            "/opt/homebrew/share/texmf-dist/fonts/pk",
+        ] {
+            roots.push(PathBuf::from(fixed));
+        }
+
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            if let Ok(entries) = std::fs::read_dir(&home) {
+                let mut texlive_home: Vec<PathBuf> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().starts_with(".texlive"))
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect();
+                texlive_home.sort();
+                texlive_home.reverse();
+                for dir in texlive_home {
+                    roots.push(dir.join("texmf-var/fonts/pk"));
+                }
+            }
+            roots.push(home.join("Library/texmf/fonts/pk"));
+        }
+
+        for root in roots {
+            if root.is_dir() {
+                scan_pk_dir(&root, &mut index);
+            }
+        }
+        index
+    })
+}
+
+fn is_pk_extension(ext: &str) -> bool {
+    ext == "pk"
+        || (ext.len() > 2
+            && ext.ends_with("pk")
+            && ext[..ext.len() - 2].bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn scan_pk_dir(root: &std::path::Path, index: &mut HashMap<String, PathBuf>) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                continue;
+            };
+            if is_pk_extension(&ext.to_ascii_lowercase()) {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    index.entry(name.to_lowercase()).or_insert(path);
+                }
+            }
+        }
+    }
+}
+
+fn parse_pk_dpi(suffix: &str) -> Option<u32> {
+    if suffix.len() > 2 && suffix.ends_with("pk") {
+        suffix[..suffix.len() - 2].parse::<u32>().ok()
+    } else {
+        None
+    }
+}
+
 fn locate_pk(name: &str) -> Option<PathBuf> {
-    let mut base_names = vec![name.to_string()];
     let lower = name.to_lowercase();
+    let index = pk_file_index();
+
+    for extension in ["600pk", "pk", "1200pk", "300pk", "2400pk"] {
+        if let Some(path) = index.get(&format!("{lower}.{extension}")) {
+            if path.exists() {
+                return Some(path.clone());
+            }
+        }
+    }
+
+    let prefix = format!("{lower}.");
+    let mut best: Option<(i64, PathBuf)> = None;
+    for (file_name, path) in index {
+        let Some(suffix) = file_name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(dpi) = parse_pk_dpi(suffix) else {
+            continue;
+        };
+        if !path.exists() {
+            continue;
+        }
+        let dist = (dpi as i64 - 600).abs();
+        if best.as_ref().map_or(true, |(best_dist, _)| dist < *best_dist) {
+            best = Some((dist, path.clone()));
+        }
+    }
+    if let Some((_, path)) = best {
+        return Some(path);
+    }
+
+    let mut base_names = vec![name.to_string()];
     if lower != name {
         base_names.push(lower);
     }
